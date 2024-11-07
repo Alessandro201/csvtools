@@ -1,8 +1,10 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
+use core::panic;
 use std::{
     cmp::max,
+    collections::VecDeque,
     fs::{File, OpenOptions},
-    io::{self},
+    io::{self, Read},
     path::PathBuf,
 };
 
@@ -24,7 +26,7 @@ pub struct FmtArgs {
     comment_char: char,
 
     /// N. of lines to keep in memory to strip of format to avoid keeping gigabytes of data in memory.
-    #[arg(short, long, default_value_t = ',', required = false)]
+    #[arg(short, long, default_value_t = ',', required = false, value_parser=parse_delimiter)]
     delimiter: char,
 
     /// N. of lines to keep in memory to strip of format to avoid keeping gigabytes of data in memory.
@@ -45,6 +47,14 @@ pub struct FmtArgs {
     input: Option<PathBuf>,
 }
 
+fn parse_delimiter(s: &str) -> Result<char, &'static str> {
+    match s {
+        "\\t" => Ok('\t'),
+        s if s.chars().count() == 1 => Ok(s.chars().next().unwrap()),
+        _ => Err("Delimiter must be a single character"),
+    }
+}
+
 pub fn strip<R: io::Read, W: io::Write>(in_stream: R, out_stream: W) -> Result<()> {
     // Build the CSV reader and iterate over each record.
     let mut rdr = csv::ReaderBuilder::new()
@@ -60,9 +70,8 @@ pub fn strip<R: io::Read, W: io::Write>(in_stream: R, out_stream: W) -> Result<(
         .flexible(true)
         .from_writer(out_stream);
 
-    for raw_record in rdr.byte_records().filter_map(|r| r.ok()) {
-        // operations.....
-        //
+    let mut raw_record: ByteRecord = ByteRecord::new();
+    while rdr.read_byte_record(&mut raw_record)? {
         wrt.write_byte_record(&raw_record)?;
     }
     wrt.flush()?;
@@ -77,48 +86,67 @@ pub fn pad_and_write<W>(
 where
     W: io::Write,
 {
-    let mut cols_width: Vec<usize> = vec![];
+    let mut cols_width: Vec<usize> = vec![0; 100];
     let mut byte_record_buffer: ByteRecord;
-    let mut lines_commented: Vec<usize> = Vec::new();
+    let mut lines_commented: VecDeque<usize> = VecDeque::new();
 
     for (line, record) in buffer.iter().enumerate() {
         if record
             .get(0)
             .unwrap_or(b"")
             .trim_ascii_start()
-            .starts_with(&[comment_char])
+            .iter()
+            .next()
+            == Some(&comment_char)
         {
-            lines_commented.push(line);
+            lines_commented.push_back(line);
             continue;
         }
 
+        if cols_width.len() < record.len() {
+            let multiplier = record.len().div_ceil(cols_width.len());
+            cols_width.resize(cols_width.len() * multiplier, 0);
+        }
+
         for (col, value) in record.iter().enumerate() {
-            if let Some(item) = cols_width.get(col) {
-                cols_width[col] = max(*item, value.len())
-            } else {
-                cols_width.push(value.len())
+            if cols_width[col] < value.len() {
+                cols_width[col] = value.len()
             }
         }
     }
 
+    let tmp_spaces = [b' '].repeat(*cols_width.iter().max().unwrap_or(&1));
+
     for (line, record) in buffer.iter().enumerate() {
-        if lines_commented.binary_search(&line).is_ok() {
-            wrt.write_byte_record(record)?;
-            continue;
+        if let Some(l) = lines_commented.front() {
+            match l.cmp(&line) {
+                std::cmp::Ordering::Less => panic!("This should not happen. A line inside fmt::pad_and_write::lines_commented was smaller than record"),
+                std::cmp::Ordering::Equal => {
+                    wrt.write_byte_record(record)?;
+                    lines_commented.pop_front();
+                    continue;
+                },
+                std::cmp::Ordering::Greater => {},
+            }
         }
 
-        byte_record_buffer = record
-            .iter()
-            .enumerate()
-            .map(|(col, value)| {
-                // Pad each field with spaces as bytes, and truncate if it exceeds pad_width
-                let mut padded_field = Vec::from(value);
-                padded_field.resize(cols_width[col], b' ');
-                padded_field
-            })
-            .collect();
-
-        wrt.write_byte_record(&byte_record_buffer)?;
+        // byte_record_buffer = record
+        //     .iter()
+        //     .enumerate()
+        //     .map(|(col, value)| {
+        //         // Pad each field with spaces as bytes, and truncate if it exceeds pad_width
+        //         let mut padded_field = Vec::from(value);
+        //         padded_field.resize(cols_width[col], b' ');
+        //         padded_field
+        //     })
+        //     .collect();
+        //
+        // wrt.write_byte_record(&byte_record_buffer)?;
+        for (col, value) in record.iter().enumerate() {
+            wrt.write_field([value, &tmp_spaces[0..(cols_width[col] - value.len())]].concat())
+                .context("unable to write field")?;
+        }
+        wrt.write_record(None::<&[u8]>)?;
     }
     Ok(())
 }
@@ -161,7 +189,10 @@ pub fn format<R: io::Read, W: io::Write>(
         pad_and_write(&mut wrt, &buffer, comment_char)?;
     } else {
         let mut raw_record = csv::ByteRecord::new();
-        while rdr.read_byte_record(&mut raw_record)? {
+        while rdr
+            .read_byte_record(&mut raw_record)
+            .context("Encountered error in parsing CSV file")?
+        {
             // operations.....
             if line_count < fmt_args.buffer_lines {
                 buffer.push(raw_record.clone());
@@ -173,6 +204,7 @@ pub fn format<R: io::Read, W: io::Write>(
             }
         }
         pad_and_write(&mut wrt, &buffer, comment_char)?;
+        wrt.flush()?;
     }
 
     wrt.flush()?;

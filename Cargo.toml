@@ -4,20 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 
-[target.stable-aarch64-apple-darwin]
-linker = "clang"
-rustflags = [
-  "-C",
-  "linker=clang",
-  "-C",
-  "link-arg=-fuse-ld=/Users/alessandro.poletti/.pixi/bin/mold",
-  "-C",
-  "link-arg=-Wl,--no-rosegment",
-]
-
-[profile.release]
-debug = true
-
 [dependencies]
 anyhow = { version = "1.0.91", features = ["backtrace"] }
 clap = { version = "4.5.20", features = ["derive"] }
