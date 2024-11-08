@@ -12,7 +12,7 @@ use csv::{self, ByteRecord, QuoteStyle};
 
 use clap::{ArgAction, Args};
 
-const DEFAULT_BUFFER_LINES: u64 = 1024 * 64;
+const DEFAULT_BUFFER_LINES: u64 = 1024;
 
 #[derive(Debug, Clone, Args)]
 #[command(flatten_help = true)]
@@ -142,6 +142,7 @@ where
         //     .collect();
         //
         // wrt.write_byte_record(&byte_record_buffer)?;
+
         for (col, value) in record.iter().enumerate() {
             wrt.write_field([value, &tmp_spaces[0..(cols_width[col] - value.len())]].concat())
                 .context("unable to write field")?;
@@ -199,6 +200,7 @@ pub fn format<R: io::Read, W: io::Write>(
                 line_count += 1;
             } else {
                 pad_and_write(&mut wrt, &buffer, comment_char)?;
+                wrt.flush()?;
                 buffer.clear();
                 line_count = 0;
             }
