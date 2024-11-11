@@ -25,8 +25,8 @@ pub struct FmtArgs {
     #[arg(short, long, default_value_t = '#', required = false)]
     comment_char: char,
 
-    /// N. of lines to keep in memory to strip of format to avoid keeping gigabytes of data in memory.
-    #[arg(short, long, default_value_t = ',', required = false, value_parser=parse_delimiter)]
+    /// Delimiter to use to parse the tabular data
+    #[arg(short, long, default_value_t = '\t', required = false, value_parser=parse_delimiter)]
     delimiter: char,
 
     /// N. of lines to keep in memory to strip of format to avoid keeping gigabytes of data in memory.
