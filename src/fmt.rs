@@ -1,18 +1,18 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use core::panic;
 use std::{
-    cmp::max,
     collections::VecDeque,
     fs::{File, OpenOptions},
-    io::{self, Read},
+    io::{self},
     path::PathBuf,
+    process::exit,
 };
 
 use csv::{self, ByteRecord, QuoteStyle};
 
 use clap::{ArgAction, Args};
 
-const DEFAULT_BUFFER_LINES: u64 = 1024;
+const DEFAULT_BUFFER_LINES: &str = "1024"; // Clap expects the default missing value to be an OsStr
 
 #[derive(Debug, Clone, Args)]
 #[command(flatten_help = true)]
@@ -30,8 +30,8 @@ pub struct FmtArgs {
     delimiter: char,
 
     /// N. of lines to keep in memory to strip of format to avoid keeping gigabytes of data in memory.
-    #[arg(short, long, default_value_t = DEFAULT_BUFFER_LINES, required=false, value_parser = clap::value_parser!(u64).range(0..(u64::MAX)))]
-    buffer_lines: u64,
+    #[arg(short, long, default_missing_value = DEFAULT_BUFFER_LINES, required=false, require_equals=true, num_args=0..=1, value_parser = clap::value_parser!(u64).range(0..(u64::MAX)))]
+    buffer_lines: Option<u64>,
 
     /*
         /// Apply the formatting in place. Works only if an input is provided.
@@ -180,22 +180,27 @@ pub fn format<R: io::Read, W: io::Write>(
         // .terminator(Terminator::CRLF)
         .from_writer(out_stream);
 
-    let mut buffer: Vec<ByteRecord> = Vec::with_capacity(fmt_args.buffer_lines as usize);
-    let mut line_count = 0;
+    let mut buffer: Vec<ByteRecord>;
+    let mut line_count: u64 = 0;
 
-    // println!("Inside format");
-
-    if fmt_args.buffer_lines == 0 || fmt_args.input.is_some() {
+    if fmt_args.buffer_lines.is_none_or(|b| b == 0) {
+        // TODO: Improve this part, catch any errors, print them and exit
         buffer = rdr.into_byte_records().filter_map(|r| r.ok()).collect();
         pad_and_write(&mut wrt, &buffer, comment_char)?;
     } else {
         let mut raw_record = csv::ByteRecord::new();
+        let buffer_lines = fmt_args
+            .buffer_lines
+            .expect("Buffer lines is None, but it should have been already checked to be Some");
+        buffer = Vec::with_capacity(buffer_lines.try_into().unwrap_or(usize::MAX));
+
+        // TODO: find a way to catch the error and print it on screen
         while rdr
             .read_byte_record(&mut raw_record)
             .context("Encountered error in parsing CSV file")?
         {
             // operations.....
-            if line_count < fmt_args.buffer_lines {
+            if line_count < buffer_lines {
                 buffer.push(raw_record.clone());
                 line_count += 1;
             } else {
