@@ -1,5 +1,5 @@
-use anyhow::Result;
 use core::panic;
+use lazy_static::lazy_static;
 use std::{
     collections::VecDeque,
     fs::{File, OpenOptions},
@@ -12,7 +12,10 @@ use csv::{self, ByteRecord, QuoteStyle};
 
 use clap::{ArgAction, Args};
 
-const DEFAULT_BUFFER_LINES: &str = "1024"; // Clap expects the default missing value to be an OsStr
+const DEFAULT_BUFFER_LINES: usize = 1024 * 16;
+lazy_static! {
+    static ref DEFAULT_BUFFER_LINES_STR: String = DEFAULT_BUFFER_LINES.to_string();
+}
 
 #[derive(Debug, Clone, Args)]
 #[command(flatten_help = true)]
@@ -39,14 +42,15 @@ pub struct FmtArgs {
         #[arg(short, long, action=ArgAction::SetTrue)]
         in_place: bool,
     */
-    // TODO: Check the existence of the files
-    #[arg(short, long)]
+    /// Save the output to a file
+    #[arg(short, long, value_parser=clap::value_parser!(PathBuf))]
     output: Option<PathBuf>,
 
     #[arg(value_name = "FILE")]
     input: Option<PathBuf>,
 }
 
+#[inline]
 fn parse_delimiter(s: &str) -> Result<char, &'static str> {
     match s {
         "\\t" => Ok('\t'),
