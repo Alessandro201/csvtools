@@ -21,7 +21,9 @@ fn main() -> Result<()> {
     let args = Cli::parse();
 
     match args.command {
-        Commands::Fmt(fmt_args) => fmt::process(fmt_args)?,
+        // TODO: Find a way to make the return of the process be a string with the error, or a
+        // stack trace for error unexpected
+        Commands::Fmt(fmt_args) => fmt::process(fmt_args),
     }
 
     Ok(())

@@ -32,9 +32,15 @@ pub struct FmtArgs {
     #[arg(short, long, default_value_t = '\t', required = false, value_parser=parse_delimiter)]
     delimiter: char,
 
-    /// N. of lines to keep in memory to strip of format to avoid keeping gigabytes of data in memory.
-    #[arg(short, long, default_missing_value = DEFAULT_BUFFER_LINES, required=false, require_equals=true, num_args=0..=1, value_parser = clap::value_parser!(u64).range(0..(u64::MAX)))]
-    buffer_lines: Option<u64>,
+    /// Hybrid buffering. Buffer the first 1024 lines to get the max width per column, then format
+    /// line by line incrementing the max width when a bigger colums is found
+    #[arg(short, long, action=ArgAction::SetTrue)]
+    // TODO: Implement this mode
+    hybrid_buffer: bool,
+
+    /// N. of lines to strip or format per chunk to avoid keeping gigabytes of data in memory.
+    #[arg(short, long, default_missing_value = DEFAULT_BUFFER_LINES_STR.as_str(), required=false, require_equals=true, num_args=0..=1, value_parser = clap::value_parser!(usize))]
+    buffer_lines: Option<usize>,
 
     /*
         /// Apply the formatting in place. Works only if an input is provided.
@@ -59,14 +65,20 @@ fn parse_delimiter(s: &str) -> Result<char, &'static str> {
     }
 }
 
-pub fn strip<R: io::Read, W: io::Write>(in_stream: R, out_stream: W) -> Result<()> {
+#[derive(Debug)]
+pub enum MyErrors {
+    CsvReadError(csv::Error),
+    CsvWriteError(csv::Error),
+    IoWriteError(io::Error),
+}
+
+pub fn strip<R: io::Read, W: io::Write>(in_stream: R, out_stream: W) -> Result<(), MyErrors> {
     // Build the CSV reader and iterate over each record.
     let mut rdr = csv::ReaderBuilder::new()
         .delimiter(b',')
         .has_headers(false)
         .flexible(true)
         // .comment(Some(b'#'))
-        .trim(csv::Trim::All)
         .from_reader(in_stream);
 
     let mut wrt = csv::WriterBuilder::new()
@@ -75,24 +87,91 @@ pub fn strip<R: io::Read, W: io::Write>(in_stream: R, out_stream: W) -> Result<(
         .from_writer(out_stream);
 
     let mut raw_record: ByteRecord = ByteRecord::new();
-    while rdr.read_byte_record(&mut raw_record)? {
-        wrt.write_byte_record(&raw_record)?;
+
+    while rdr
+        .read_byte_record(&mut raw_record)
+        .map_err(MyErrors::CsvReadError)?
+    {
+        for f in raw_record.iter() {
+            wrt.write_field(f.trim_ascii())
+                .map_err(MyErrors::CsvReadError)?
+        }
+
+        wrt.write_record(None::<&[u8]>)
+            .map_err(MyErrors::CsvReadError)?
     }
-    wrt.flush()?;
+    wrt.flush().map_err(MyErrors::IoWriteError)?;
+
     Ok(())
 }
 
-pub fn pad_and_write<W>(
+pub fn pad_and_write_unbuffered<W, R>(
+    wrt: &mut csv::Writer<W>,
+    rdr: &mut csv::Reader<R>,
+    comment_char: u8,
+    mut cols_width: Vec<usize>,
+) -> Result<Vec<usize>, MyErrors>
+where
+    W: io::Write,
+    R: io::Read,
+{
+    // let mut byte_record_buffer: ByteRecord;
+
+    let tmp_spaces = [b' '].repeat(*cols_width.iter().max().unwrap_or(&1));
+    let mut tmp_field = Vec::with_capacity(cols_width.iter().sum());
+    let mut tmp_byte_record = ByteRecord::with_capacity(cols_width.iter().sum(), cols_width.len());
+    let mut raw_record = ByteRecord::new();
+
+    while rdr
+        .read_byte_record(&mut raw_record)
+        .map_err(MyErrors::CsvReadError)?
+    {
+        if raw_record
+            .get(0)
+            .unwrap_or(b"")
+            .trim_ascii_start()
+            .iter()
+            .next()
+            == Some(&comment_char)
+        {
+            wrt.write_byte_record(&raw_record)
+                .map_err(MyErrors::CsvWriteError)?;
+            continue;
+        }
+
+        if cols_width.len() < raw_record.len() {
+            let multiplier = raw_record.len().div_ceil(cols_width.len());
+            cols_width.resize(cols_width.len() * multiplier, 0);
+        }
+
+        tmp_byte_record.clear();
+        for (col, value) in raw_record.iter().enumerate() {
+            if cols_width[col] < value.len() {
+                cols_width[col] = value.len()
+            }
+            tmp_field.clear();
+            tmp_field.extend_from_slice(value);
+            tmp_field.extend_from_slice(&tmp_spaces[0..=(cols_width[col] - value.len())]);
+            tmp_byte_record.push_field(&tmp_field);
+        }
+        wrt.write_byte_record(&tmp_byte_record)
+            .map_err(MyErrors::CsvWriteError)?;
+    }
+
+    Ok(cols_width)
+}
+
+pub fn pad_and_write_buffered<W>(
     wrt: &mut csv::Writer<W>,
     buffer: &[ByteRecord],
     comment_char: u8,
-) -> Result<()>
+) -> Result<Vec<usize>, csv::Error>
 where
     W: io::Write,
 {
     let mut cols_width: Vec<usize> = vec![0; 100];
-    let mut byte_record_buffer: ByteRecord;
     let mut lines_commented: VecDeque<usize> = VecDeque::new();
+    // let mut byte_record_buffer: ByteRecord;
 
     for (line, record) in buffer.iter().enumerate() {
         if record
@@ -120,7 +199,8 @@ where
     }
 
     let tmp_spaces = [b' '].repeat(*cols_width.iter().max().unwrap_or(&1));
-
+    let mut tmp_field = Vec::with_capacity(cols_width.iter().sum());
+    let mut tmp_byte_record = ByteRecord::with_capacity(cols_width.iter().sum(), cols_width.len());
     for (line, record) in buffer.iter().enumerate() {
         if let Some(l) = lines_commented.front() {
             match l.cmp(&line) {
@@ -134,33 +214,31 @@ where
             }
         }
 
-        // byte_record_buffer = record
-        //     .iter()
-        //     .enumerate()
-        //     .map(|(col, value)| {
-        //         // Pad each field with spaces as bytes, and truncate if it exceeds pad_width
-        //         let mut padded_field = Vec::from(value);
-        //         padded_field.resize(cols_width[col], b' ');
-        //         padded_field
-        //     })
-        //     .collect();
-        //
-        // wrt.write_byte_record(&byte_record_buffer)?;
+        // for (col, value) in record.iter().enumerate() {
+        //     tmp_field.clear();
+        //     tmp_field.extend_from_slice(value);
+        //     tmp_field.extend_from_slice(&tmp_spaces[0..(cols_width[col] - value.len())]);
+        //     wrt.write_field(&tmp_field)?
+        // }
+        // wrt.write_record(None::<&[u8]>)?;
 
+        tmp_byte_record.clear();
         for (col, value) in record.iter().enumerate() {
-            wrt.write_field([value, &tmp_spaces[0..(cols_width[col] - value.len())]].concat())
-                .context("unable to write field")?;
+            tmp_field.clear();
+            tmp_field.extend_from_slice(value);
+            tmp_field.extend_from_slice(&tmp_spaces[0..=(cols_width[col] - value.len())]);
+            tmp_byte_record.push_field(&tmp_field);
         }
-        wrt.write_record(None::<&[u8]>)?;
+        wrt.write_byte_record(&tmp_byte_record)?;
     }
-    Ok(())
+    Ok(cols_width)
 }
 
 pub fn format<R: io::Read, W: io::Write>(
     in_stream: R,
     out_stream: W,
     fmt_args: FmtArgs,
-) -> Result<()> {
+) -> Result<(), MyErrors> {
     let comment_char: u8 = fmt_args.comment_char as u8;
     let delimiter: u8 = fmt_args.delimiter as u8;
 
@@ -185,75 +263,131 @@ pub fn format<R: io::Read, W: io::Write>(
         .from_writer(out_stream);
 
     let mut buffer: Vec<ByteRecord>;
-    let mut line_count: u64 = 0;
+    let mut line_count = 0;
+    let mut raw_record = ByteRecord::new();
 
-    if fmt_args.buffer_lines.is_none_or(|b| b == 0) {
-        // TODO: Improve this part, catch any errors, print them and exit
-        buffer = rdr.into_byte_records().filter_map(|r| r.ok()).collect();
-        pad_and_write(&mut wrt, &buffer, comment_char)?;
-    } else {
-        let mut raw_record = csv::ByteRecord::new();
-        let buffer_lines = fmt_args
-            .buffer_lines
-            .expect("Buffer lines is None, but it should have been already checked to be Some");
-        buffer = Vec::with_capacity(buffer_lines.try_into().unwrap_or(usize::MAX));
+    if fmt_args.hybrid_buffer {
+        let buffer_lines = fmt_args.buffer_lines.unwrap_or(DEFAULT_BUFFER_LINES);
+        buffer = Vec::with_capacity(buffer_lines);
 
-        // TODO: find a way to catch the error and print it on screen
         while rdr
             .read_byte_record(&mut raw_record)
-            .context("Encountered error in parsing CSV file")?
+            .map_err(MyErrors::CsvReadError)?
         {
-            // operations.....
             if line_count < buffer_lines {
                 buffer.push(raw_record.clone());
                 line_count += 1;
             } else {
-                pad_and_write(&mut wrt, &buffer, comment_char)?;
-                wrt.flush()?;
+                break;
+            }
+        }
+
+        let cols_width = pad_and_write_buffered(&mut wrt, &buffer, comment_char)
+            .map_err(MyErrors::CsvWriteError)?;
+        wrt.flush().map_err(MyErrors::IoWriteError)?;
+
+        pad_and_write_unbuffered(&mut wrt, &mut rdr, comment_char, cols_width)?;
+    } else if fmt_args.buffer_lines.is_none_or(|b| b == 0) {
+        buffer = Vec::new();
+        while rdr
+            .read_byte_record(&mut raw_record)
+            .map_err(MyErrors::CsvReadError)?
+        {
+            buffer.push(raw_record.clone())
+        }
+        pad_and_write_buffered(&mut wrt, &buffer, comment_char).map_err(MyErrors::CsvWriteError)?;
+    } else {
+        let buffer_lines = fmt_args
+            .buffer_lines
+            .expect("Buffer lines is None, but it should have been already checked to be Some");
+        buffer = Vec::with_capacity(buffer_lines);
+
+        while rdr
+            .read_byte_record(&mut raw_record)
+            .map_err(MyErrors::CsvReadError)?
+        {
+            if line_count < buffer_lines {
+                buffer.push(raw_record.clone());
+                line_count += 1;
+            } else {
+                pad_and_write_buffered(&mut wrt, &buffer, comment_char)
+                    .map_err(MyErrors::CsvWriteError)?;
+                wrt.flush().map_err(MyErrors::IoWriteError)?;
                 buffer.clear();
                 line_count = 0;
             }
         }
-        pad_and_write(&mut wrt, &buffer, comment_char)?;
-        wrt.flush()?;
+        pad_and_write_buffered(&mut wrt, &buffer, comment_char).map_err(MyErrors::CsvWriteError)?;
+        wrt.flush().map_err(MyErrors::IoWriteError)?;
     }
 
-    wrt.flush()?;
+    wrt.flush().map_err(MyErrors::IoWriteError)?;
     Ok(())
 }
 
-pub fn process(fmt_args: FmtArgs) -> Result<()> {
+pub fn process(fmt_args: FmtArgs) {
     // println!("fmt::process received this args: {:#?}", fmt_args);
 
-    let in_stream: Box<dyn io::Read> = if let Some(file_path) = &fmt_args.input {
+    let in_stream: Box<dyn io::Read>;
+    if let Some(file_path) = &fmt_args.input {
         // println!("Reading from file {:?}", &file_path);
-        Box::new(File::open(file_path)?)
+        let file_handle = match File::open(file_path) {
+            Ok(handle) => handle,
+            Err(err) => {
+                eprintln!("Error in reading file {:?}: {:?}", file_path, err);
+                exit(1);
+            }
+        };
+        in_stream = Box::new(file_handle)
     } else {
         // println!("Reading from stdin");
-        Box::new(io::stdin())
+        in_stream = Box::new(io::stdin())
     };
 
-    let out_stream: Box<dyn io::Write> = if let Some(file_path) = &fmt_args.output {
+    let out_stream: Box<dyn io::Write>;
+    if let Some(file_path) = &fmt_args.output {
         // println!("Writing to file {:?}", &file_path);
-        Box::new(
-            OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(file_path)?,
-        )
+        let file_handle = match OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(file_path)
+        {
+            Ok(handle) => handle,
+            Err(err) => {
+                eprintln!("Error in opening output file {:?}: {:?}", file_path, err);
+                exit(1)
+            }
+        };
+        out_stream = Box::new(file_handle)
     } else {
         // println!("Writing to stdout");
-        Box::new(io::stdout().lock())
+        out_stream = Box::new(io::stdout().lock())
     };
 
-    if fmt_args.strip {
-        // println!("Stripping...\n\n");
-        strip(in_stream, out_stream)?
+    let result = if fmt_args.strip {
+        strip(in_stream, out_stream)
     } else {
-        // println!("Formatting...\n\n");
-        format(in_stream, out_stream, fmt_args)?
-    }
+        format(in_stream, out_stream, fmt_args)
+    };
 
-    Ok(())
+    if let Err(err) = result {
+        match err {
+            MyErrors::CsvReadError(err) => {
+                eprintln!("Error in reading the data: {}", err);
+                exit(1)
+            }
+            MyErrors::CsvWriteError(err) => match err.kind() {
+                csv::ErrorKind::Io(err) if err.kind() == io::ErrorKind::BrokenPipe => exit(0),
+                _ => {
+                    eprintln!("Error in writing the data: {}", err);
+                    exit(1)
+                }
+            },
+            MyErrors::IoWriteError(err) => {
+                eprintln!("Error in writing the data: {}", err);
+                exit(1)
+            }
+        }
+    }
 }
