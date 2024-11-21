@@ -32,13 +32,9 @@ pub struct FmtArgs {
     #[arg(short, long, default_value_t = '\t', required = false, value_parser=parse_delimiter)]
     delimiter: char,
 
-    /// Hybrid buffering. Buffer the first 1024 lines to get the max width per column, then format
-    /// line by line incrementing the max width when a bigger colums is found
-    #[arg(short, long, action=ArgAction::SetTrue)]
-    // TODO: Implement this mode
-    hybrid_buffer: bool,
-
-    /// N. of lines to strip or format per chunk to avoid keeping gigabytes of data in memory.
+    /// Do not format the whole file at one time but buffer the first 16384 lines to get the max width per column,
+    /// then format line by line incrementing the max width when a bigger colums is found.
+    /// You can specify the number of lines to buffer. Use 0 to format line by line from the start..
     #[arg(short, long, default_missing_value = DEFAULT_BUFFER_LINES_STR.as_str(), required=false, require_equals=true, num_args=0..=1, value_parser = clap::value_parser!(usize))]
     buffer_lines: Option<usize>,
 
@@ -266,20 +262,16 @@ pub fn format<R: io::Read, W: io::Write>(
     let mut line_count = 0;
     let mut raw_record = ByteRecord::new();
 
-    if fmt_args.hybrid_buffer {
-        let buffer_lines = fmt_args.buffer_lines.unwrap_or(DEFAULT_BUFFER_LINES);
+    if let Some(buffer_lines) = fmt_args.buffer_lines {
         buffer = Vec::with_capacity(buffer_lines);
 
-        while rdr
-            .read_byte_record(&mut raw_record)
-            .map_err(MyErrors::CsvReadError)?
+        while line_count < buffer_lines
+            && rdr
+                .read_byte_record(&mut raw_record)
+                .map_err(MyErrors::CsvReadError)?
         {
-            if line_count < buffer_lines {
-                buffer.push(raw_record.clone());
-                line_count += 1;
-            } else {
-                break;
-            }
+            buffer.push(raw_record.clone());
+            line_count += 1;
         }
 
         let cols_width = pad_and_write_buffered(&mut wrt, &buffer, comment_char)
@@ -287,7 +279,9 @@ pub fn format<R: io::Read, W: io::Write>(
         wrt.flush().map_err(MyErrors::IoWriteError)?;
 
         pad_and_write_unbuffered(&mut wrt, &mut rdr, comment_char, cols_width)?;
-    } else if fmt_args.buffer_lines.is_none_or(|b| b == 0) {
+        wrt.flush().map_err(MyErrors::IoWriteError)?;
+    } else {
+        // TODO: Add saving the buffer to a file in case it exceed the memory available
         buffer = Vec::new();
         while rdr
             .read_byte_record(&mut raw_record)
@@ -296,32 +290,9 @@ pub fn format<R: io::Read, W: io::Write>(
             buffer.push(raw_record.clone())
         }
         pad_and_write_buffered(&mut wrt, &buffer, comment_char).map_err(MyErrors::CsvWriteError)?;
-    } else {
-        let buffer_lines = fmt_args
-            .buffer_lines
-            .expect("Buffer lines is None, but it should have been already checked to be Some");
-        buffer = Vec::with_capacity(buffer_lines);
-
-        while rdr
-            .read_byte_record(&mut raw_record)
-            .map_err(MyErrors::CsvReadError)?
-        {
-            if line_count < buffer_lines {
-                buffer.push(raw_record.clone());
-                line_count += 1;
-            } else {
-                pad_and_write_buffered(&mut wrt, &buffer, comment_char)
-                    .map_err(MyErrors::CsvWriteError)?;
-                wrt.flush().map_err(MyErrors::IoWriteError)?;
-                buffer.clear();
-                line_count = 0;
-            }
-        }
-        pad_and_write_buffered(&mut wrt, &buffer, comment_char).map_err(MyErrors::CsvWriteError)?;
         wrt.flush().map_err(MyErrors::IoWriteError)?;
     }
 
-    wrt.flush().map_err(MyErrors::IoWriteError)?;
     Ok(())
 }
 
