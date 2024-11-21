@@ -24,13 +24,17 @@ pub struct FmtArgs {
     #[arg(short, long, action=ArgAction::SetTrue)]
     strip: bool,
 
+    /// Delimiter to use to parse the tabular data
+    #[arg(short, long, default_value_t = '\t', required = false, value_parser=parse_char)]
+    delimiter: char,
+
     /// Lines starting with this character will be ingored
     #[arg(short, long, default_value_t = '#', required = false)]
     comment_char: char,
 
-    /// Delimiter to use to parse the tabular data
-    #[arg(short, long, default_value_t = '\t', required = false, value_parser=parse_delimiter)]
-    delimiter: char,
+    /// quote character
+    #[arg(short, long, default_value_t = '"', required = false, value_parser=parse_char)]
+    quote_char: char,
 
     /// Do not format the whole file at one time but buffer the first 16384 lines to get the max width per column,
     /// then format line by line incrementing the max width when a bigger colums is found.
@@ -53,7 +57,7 @@ pub struct FmtArgs {
 }
 
 #[inline]
-fn parse_delimiter(s: &str) -> Result<char, &'static str> {
+fn parse_char(s: &str) -> Result<char, &'static str> {
     match s {
         "\\t" => Ok('\t'),
         s if s.chars().count() == 1 => Ok(s.chars().next().unwrap()),
@@ -68,18 +72,30 @@ pub enum MyErrors {
     IoWriteError(io::Error),
 }
 
-pub fn strip<R: io::Read, W: io::Write>(in_stream: R, out_stream: W) -> Result<(), MyErrors> {
+pub fn strip<R: io::Read, W: io::Write>(
+    in_stream: R,
+    out_stream: W,
+    fmt_args: FmtArgs,
+) -> Result<(), MyErrors> {
     // Build the CSV reader and iterate over each record.
     let mut rdr = csv::ReaderBuilder::new()
-        .delimiter(b',')
+        .delimiter(fmt_args.delimiter as u8)
         .has_headers(false)
         .flexible(true)
-        // .comment(Some(b'#'))
+        .quote(fmt_args.quote_char as u8)
+        .double_quote(true)
+        .comment(Some(fmt_args.comment_char as u8))
+        // .terminator(Terminator::CRLF)
         .from_reader(in_stream);
 
     let mut wrt = csv::WriterBuilder::new()
-        .delimiter(b',')
+        .delimiter(fmt_args.delimiter as u8)
+        .has_headers(false)
         .flexible(true)
+        .quote(fmt_args.quote_char as u8)
+        .quote_style(QuoteStyle::Never)
+        .double_quote(true)
+        // .terminator(Terminator::CRLF)
         .from_writer(out_stream);
 
     let mut raw_record: ByteRecord = ByteRecord::new();
@@ -243,7 +259,7 @@ pub fn format<R: io::Read, W: io::Write>(
         .delimiter(delimiter)
         .has_headers(false)
         .flexible(true)
-        .quote(b'"')
+        .quote(fmt_args.quote_char as u8)
         .double_quote(true)
         // .terminator(Terminator::CRLF)
         .from_reader(in_stream);
@@ -252,7 +268,7 @@ pub fn format<R: io::Read, W: io::Write>(
         .delimiter(delimiter)
         .has_headers(false)
         .flexible(true)
-        .quote(b'"')
+        .quote(fmt_args.quote_char as u8)
         .quote_style(QuoteStyle::Never)
         .double_quote(true)
         // .terminator(Terminator::CRLF)
@@ -297,11 +313,8 @@ pub fn format<R: io::Read, W: io::Write>(
 }
 
 pub fn process(fmt_args: FmtArgs) {
-    // println!("fmt::process received this args: {:#?}", fmt_args);
-
     let in_stream: Box<dyn io::Read>;
     if let Some(file_path) = &fmt_args.input {
-        // println!("Reading from file {:?}", &file_path);
         let file_handle = match File::open(file_path) {
             Ok(handle) => handle,
             Err(err) => {
@@ -311,13 +324,11 @@ pub fn process(fmt_args: FmtArgs) {
         };
         in_stream = Box::new(file_handle)
     } else {
-        // println!("Reading from stdin");
         in_stream = Box::new(io::stdin())
     };
 
     let out_stream: Box<dyn io::Write>;
     if let Some(file_path) = &fmt_args.output {
-        // println!("Writing to file {:?}", &file_path);
         let file_handle = match OpenOptions::new()
             .write(true)
             .create(true)
@@ -332,12 +343,11 @@ pub fn process(fmt_args: FmtArgs) {
         };
         out_stream = Box::new(file_handle)
     } else {
-        // println!("Writing to stdout");
         out_stream = Box::new(io::stdout().lock())
     };
 
     let result = if fmt_args.strip {
-        strip(in_stream, out_stream)
+        strip(in_stream, out_stream, fmt_args)
     } else {
         format(in_stream, out_stream, fmt_args)
     };
