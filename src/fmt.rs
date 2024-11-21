@@ -117,6 +117,54 @@ pub fn strip<R: io::Read, W: io::Write>(
     Ok(())
 }
 
+pub fn pad_and_write_unchecked<W, R>(
+    wrt: &mut csv::Writer<W>,
+    rdr: &mut csv::Reader<R>,
+    comment_char: u8,
+    cols_width: Vec<usize>,
+) -> Result<Vec<usize>, MyErrors>
+where
+    W: io::Write,
+    R: io::Read,
+{
+    // let mut byte_record_buffer: ByteRecord;
+
+    let tmp_spaces = [b' '].repeat(*cols_width.iter().max().unwrap_or(&1));
+    let mut tmp_field = Vec::with_capacity(cols_width.iter().sum());
+    let mut tmp_byte_record = ByteRecord::with_capacity(cols_width.iter().sum(), cols_width.len());
+    let mut raw_record = ByteRecord::new();
+
+    while rdr
+        .read_byte_record(&mut raw_record)
+        .map_err(MyErrors::CsvReadError)?
+    {
+        if raw_record
+            .get(0)
+            .unwrap_or(b"")
+            .trim_ascii_start()
+            .iter()
+            .next()
+            == Some(&comment_char)
+        {
+            wrt.write_byte_record(&raw_record)
+                .map_err(MyErrors::CsvWriteError)?;
+            continue;
+        }
+
+        tmp_byte_record.clear();
+        for (col, value) in raw_record.iter().enumerate() {
+            tmp_field.clear();
+            tmp_field.extend_from_slice(value);
+            tmp_field.extend_from_slice(&tmp_spaces[0..=(cols_width[col] - value.len())]);
+            tmp_byte_record.push_field(&tmp_field);
+        }
+        wrt.write_byte_record(&tmp_byte_record)
+            .map_err(MyErrors::CsvWriteError)?;
+    }
+
+    Ok(cols_width)
+}
+
 pub fn pad_and_write_unbuffered<W, R>(
     wrt: &mut csv::Writer<W>,
     rdr: &mut csv::Reader<R>,
@@ -306,6 +354,37 @@ pub fn format<R: io::Read, W: io::Write>(
         wrt.flush().map_err(MyErrors::IoWriteError)?;
 
         pad_and_write_unbuffered(&mut wrt, &mut rdr, comment_char, cols_width)?;
+        wrt.flush().map_err(MyErrors::IoWriteError)?;
+    } else if fmt_args.input.is_some() {
+        let mut cols_width = vec![0; 100];
+        while rdr
+            .read_byte_record(&mut raw_record)
+            .map_err(MyErrors::CsvReadError)?
+        {
+            if raw_record
+                .get(0)
+                .unwrap_or(b"")
+                .trim_ascii_start()
+                .iter()
+                .next()
+                == Some(&comment_char)
+            {
+                continue;
+            }
+
+            if cols_width.len() < raw_record.len() {
+                let multiplier = raw_record.len().div_ceil(cols_width.len());
+                cols_width.resize(cols_width.len() * multiplier, 0);
+            }
+
+            for (col, value) in raw_record.iter().enumerate() {
+                if cols_width[col] < value.len() {
+                    cols_width[col] = value.len()
+                }
+            }
+        }
+
+        pad_and_write_unchecked(&mut wrt, &mut rdr, comment_char, cols_width)?;
         wrt.flush().map_err(MyErrors::IoWriteError)?;
     } else {
         // TODO: Add saving the buffer to a file in case it exceed the memory available
