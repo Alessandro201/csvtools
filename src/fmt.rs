@@ -182,7 +182,7 @@ where
     W: io::Write,
 {
     let mut cols_width: Vec<usize> = vec![0; 100];
-    let mut lines_commented: VecDeque<usize> = VecDeque::new();
+    // let mut lines_commented: VecDeque<usize> = VecDeque::new();
     // let mut byte_record_buffer: ByteRecord;
 
     for (line, record) in buffer.iter().enumerate() {
@@ -194,7 +194,7 @@ where
             .next()
             == Some(&comment_char)
         {
-            lines_commented.push_back(line);
+            // lines_commented.push_back(line);
             continue;
         }
 
@@ -214,16 +214,27 @@ where
     let mut tmp_field = Vec::with_capacity(cols_width.iter().sum());
     let mut tmp_byte_record = ByteRecord::with_capacity(cols_width.iter().sum(), cols_width.len());
     for (line, record) in buffer.iter().enumerate() {
-        if let Some(l) = lines_commented.front() {
-            match l.cmp(&line) {
-                std::cmp::Ordering::Less => panic!("This should not happen. A line inside fmt::pad_and_write::lines_commented was smaller than record"),
-                std::cmp::Ordering::Equal => {
-                    wrt.write_byte_record(record)?;
-                    lines_commented.pop_front();
-                    continue;
-                },
-                std::cmp::Ordering::Greater => {},
-            }
+        // if let Some(l) = lines_commented.front() {
+        //     match l.cmp(&line) {
+        //         std::cmp::Ordering::Less => panic!("This should not happen. A line inside fmt::pad_and_write::lines_commented was smaller than record"),
+        //         std::cmp::Ordering::Equal => {
+        //             wrt.write_byte_record(record)?;
+        //             lines_commented.pop_front();
+        //             continue;
+        //         },
+        //         std::cmp::Ordering::Greater => {},
+        //     }
+        // }
+        if record
+            .get(0)
+            .unwrap_or(b"")
+            .trim_ascii_start()
+            .iter()
+            .next()
+            == Some(&comment_char)
+        {
+            wrt.write_byte_record(record)?;
+            continue;
         }
 
         // for (col, value) in record.iter().enumerate() {
