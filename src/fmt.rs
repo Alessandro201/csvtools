@@ -201,7 +201,7 @@ where
     W: io::Write,
     R: io::Read,
 {
-    let tmp_spaces = [b' '].repeat(*cols_width.iter().max().unwrap_or(&1));
+    let mut tmp_spaces = [b' '].repeat(*cols_width.iter().max().unwrap_or(&1));
     let mut tmp_field = Vec::with_capacity(cols_width.iter().sum());
     let mut tmp_byte_record = ByteRecord::with_capacity(cols_width.iter().sum(), cols_width.len());
     let mut raw_record = ByteRecord::new();
@@ -223,7 +223,8 @@ where
         tmp_byte_record.clear();
         for (col, value) in raw_record.iter().enumerate() {
             if cols_width[col] < value.len() {
-                cols_width[col] = value.len()
+                cols_width[col] = value.len();
+                tmp_spaces = [b' '].repeat(tmp_spaces.len().max(value.len()));
             }
             tmp_field.clear();
             tmp_field.extend_from_slice(value);
@@ -260,7 +261,9 @@ where
         }
 
         for (col, value) in record.iter().enumerate() {
-            cols_width[col] = cols_width[col].max(value.len())
+            if cols_width[col] < value.len() {
+                cols_width[col] = value.len()
+            }
         }
     }
 
@@ -405,7 +408,9 @@ pub fn format_file<P: AsRef<Path>>(file_path: P, fmt_args: FmtArgs) -> Result<()
             }
 
             for (col, value) in raw_record.iter().enumerate() {
-                cols_width[col] = cols_width[col].max(value.len())
+                if cols_width[col] < value.len() {
+                    cols_width[col] = value.len()
+                }
             }
         }
 
