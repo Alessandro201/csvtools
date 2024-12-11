@@ -1,4 +1,3 @@
-use core::panic;
 use lazy_static::lazy_static;
 use memmap::{Mmap, MmapOptions};
 use std::io::Write;
@@ -162,8 +161,6 @@ where
     W: io::Write,
     R: io::Read,
 {
-    // let mut byte_record_buffer: ByteRecord;
-
     let tmp_spaces = [b' '].repeat(*cols_width.iter().max().unwrap_or(&1));
     let mut tmp_field = Vec::with_capacity(cols_width.iter().sum());
     let mut tmp_byte_record = ByteRecord::with_capacity(cols_width.iter().sum(), cols_width.len());
@@ -173,14 +170,7 @@ where
         .read_byte_record(&mut raw_record)
         .map_err(MyErrors::CsvReadError)?
     {
-        if raw_record
-            .get(0)
-            .unwrap_or(b"")
-            .trim_ascii_start()
-            .iter()
-            .next()
-            == Some(&comment_char)
-        {
+        if raw_record.get(0).unwrap_or(b"").first() == Some(&comment_char) {
             wrt.write_byte_record(&raw_record)
                 .map_err(MyErrors::CsvWriteError)?;
             continue;
@@ -211,8 +201,6 @@ where
     W: io::Write,
     R: io::Read,
 {
-    // let mut byte_record_buffer: ByteRecord;
-
     let tmp_spaces = [b' '].repeat(*cols_width.iter().max().unwrap_or(&1));
     let mut tmp_field = Vec::with_capacity(cols_width.iter().sum());
     let mut tmp_byte_record = ByteRecord::with_capacity(cols_width.iter().sum(), cols_width.len());
@@ -222,22 +210,14 @@ where
         .read_byte_record(&mut raw_record)
         .map_err(MyErrors::CsvReadError)?
     {
-        if raw_record
-            .get(0)
-            .unwrap_or(b"")
-            .trim_ascii_start()
-            .iter()
-            .next()
-            == Some(&comment_char)
-        {
+        if raw_record.get(0).unwrap_or(b"").first() == Some(&comment_char) {
             wrt.write_byte_record(&raw_record)
                 .map_err(MyErrors::CsvWriteError)?;
             continue;
         }
 
-        if cols_width.len() < raw_record.len() {
-            let multiplier = raw_record.len().div_ceil(cols_width.len());
-            cols_width.resize(cols_width.len() * multiplier, 0);
+        if raw_record.len() > cols_width.len() {
+            cols_width.resize(raw_record.len(), 0);
         }
 
         tmp_byte_record.clear();
@@ -265,32 +245,22 @@ pub fn pad_and_write_buffered<W>(
 where
     W: io::Write,
 {
-    let mut cols_width: Vec<usize> = vec![0; 100];
+    let mut cols_width: Vec<usize> = vec![0; 1000];
     // let mut lines_commented: VecDeque<usize> = VecDeque::new();
     // let mut byte_record_buffer: ByteRecord;
 
     for (line, record) in buffer.iter().enumerate() {
-        if record
-            .get(0)
-            .unwrap_or(b"")
-            .trim_ascii_start()
-            .iter()
-            .next()
-            == Some(&comment_char)
-        {
+        if record.get(0).unwrap_or(b"").first() == Some(&comment_char) {
             // lines_commented.push_back(line);
             continue;
         }
 
         if cols_width.len() < record.len() {
-            let multiplier = record.len().div_ceil(cols_width.len());
-            cols_width.resize(cols_width.len() * multiplier, 0);
+            cols_width.resize(record.len(), 0);
         }
 
         for (col, value) in record.iter().enumerate() {
-            if cols_width[col] < value.len() {
-                cols_width[col] = value.len()
-            }
+            cols_width[col] = cols_width[col].max(value.len())
         }
     }
 
@@ -309,14 +279,7 @@ where
         //         std::cmp::Ordering::Greater => {},
         //     }
         // }
-        if record
-            .get(0)
-            .unwrap_or(b"")
-            .trim_ascii_start()
-            .iter()
-            .next()
-            == Some(&comment_char)
-        {
+        if record.get(0).unwrap_or(b"").first() == Some(&comment_char) {
             wrt.write_byte_record(record)?;
             continue;
         }
@@ -433,26 +396,16 @@ pub fn format_file<P: AsRef<Path>>(file_path: P, fmt_args: FmtArgs) -> Result<()
             .read_byte_record(&mut raw_record)
             .map_err(MyErrors::CsvReadError)?
         {
-            if raw_record
-                .get(0)
-                .unwrap_or(b"")
-                .trim_ascii_start()
-                .iter()
-                .next()
-                == Some(&comment_char)
-            {
+            if raw_record.get(0).unwrap_or(b"").first() == Some(&comment_char) {
                 continue;
             }
 
             if cols_width.len() < raw_record.len() {
-                let multiplier = raw_record.len().div_ceil(cols_width.len());
-                cols_width.resize(cols_width.len() * multiplier, 0);
+                cols_width.resize(raw_record.len(), 0);
             }
 
             for (col, value) in raw_record.iter().enumerate() {
-                if cols_width[col] < value.len() {
-                    cols_width[col] = value.len()
-                }
+                cols_width[col] = cols_width[col].max(value.len())
             }
         }
 
