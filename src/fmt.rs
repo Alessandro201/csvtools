@@ -1,8 +1,6 @@
 use lazy_static::lazy_static;
-use memmap::{Mmap, MmapOptions};
-use std::io::Write;
+use memmap::Mmap;
 use std::{
-    collections::VecDeque,
     fs::{File, OpenOptions},
     io::{self},
     path::{Path, PathBuf},
@@ -247,12 +245,9 @@ where
     W: io::Write,
 {
     let mut cols_width: Vec<usize> = vec![0; 1000];
-    // let mut lines_commented: VecDeque<usize> = VecDeque::new();
-    // let mut byte_record_buffer: ByteRecord;
 
-    for (line, record) in buffer.iter().enumerate() {
+    for record in buffer.iter() {
         if record.get(0).unwrap_or(b"").first() == Some(&comment_char) {
-            // lines_commented.push_back(line);
             continue;
         }
 
@@ -270,18 +265,7 @@ where
     let tmp_spaces = [b' '].repeat(*cols_width.iter().max().unwrap_or(&1));
     let mut tmp_field = Vec::with_capacity(cols_width.iter().sum());
     let mut tmp_byte_record = ByteRecord::with_capacity(cols_width.iter().sum(), cols_width.len());
-    for (line, record) in buffer.iter().enumerate() {
-        // if let Some(l) = lines_commented.front() {
-        //     match l.cmp(&line) {
-        //         std::cmp::Ordering::Less => panic!("This should not happen. A line inside fmt::pad_and_write::lines_commented was smaller than record"),
-        //         std::cmp::Ordering::Equal => {
-        //             wrt.write_byte_record(record)?;
-        //             lines_commented.pop_front();
-        //             continue;
-        //         },
-        //         std::cmp::Ordering::Greater => {},
-        //     }
-        // }
+    for record in buffer.iter() {
         if record.get(0).unwrap_or(b"").first() == Some(&comment_char) {
             wrt.write_byte_record(record)?;
             continue;
