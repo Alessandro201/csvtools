@@ -1,10 +1,12 @@
 use core::panic;
 use lazy_static::lazy_static;
+use memmap::{Mmap, MmapOptions};
+use std::io::Write;
 use std::{
     collections::VecDeque,
     fs::{File, OpenOptions},
     io::{self},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::exit,
 };
 
@@ -72,45 +74,78 @@ pub enum MyErrors {
     IoWriteError(io::Error),
 }
 
-pub fn strip<R: io::Read, W: io::Write>(
-    in_stream: R,
-    out_stream: W,
-    fmt_args: FmtArgs,
-) -> Result<(), MyErrors> {
+pub fn strip(fmt_args: FmtArgs) -> Result<(), MyErrors> {
+    let comment_char: u8 = fmt_args.comment_char as u8;
+    let delimiter: u8 = fmt_args.delimiter as u8;
+    let quote_char: u8 = fmt_args.quote_char as u8;
+
+    let in_stream: Box<dyn io::Read> = if let Some(in_path) = fmt_args.input {
+        let file_handle = File::open(&in_path)
+            .inspect_err(|e| {
+                eprintln!("Error in reading input file {:?}: {e}", in_path);
+                exit(1)
+            })
+            .unwrap();
+        Box::new(file_handle)
+    } else {
+        Box::new(io::stdin())
+    };
+
     // Build the CSV reader and iterate over each record.
     let mut rdr = csv::ReaderBuilder::new()
-        .delimiter(fmt_args.delimiter as u8)
+        .delimiter(delimiter)
         .has_headers(false)
         .flexible(true)
-        .quote(fmt_args.quote_char as u8)
+        .quote(quote_char)
         .double_quote(true)
-        .comment(Some(fmt_args.comment_char as u8))
+        .comment(Some(comment_char))
         // .terminator(Terminator::CRLF)
         .from_reader(in_stream);
 
+    let out_stream: Box<dyn io::Write> = if let Some(file_path) = &fmt_args.output {
+        let file_handle = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(file_path)
+            .inspect_err(|err| {
+                eprintln!("Error in opening output file {:?}: {:?}", file_path, err);
+                exit(1)
+            })
+            .unwrap();
+        Box::new(file_handle)
+    } else {
+        Box::new(io::stdout().lock())
+    };
+
     let mut wrt = csv::WriterBuilder::new()
-        .delimiter(fmt_args.delimiter as u8)
+        .delimiter(delimiter)
         .has_headers(false)
         .flexible(true)
-        .quote(fmt_args.quote_char as u8)
+        .quote(quote_char)
         .quote_style(QuoteStyle::Never)
         .double_quote(true)
         // .terminator(Terminator::CRLF)
         .from_writer(out_stream);
 
     let mut raw_record: ByteRecord = ByteRecord::new();
-
     while rdr
         .read_byte_record(&mut raw_record)
         .map_err(MyErrors::CsvReadError)?
     {
-        for f in raw_record.iter() {
-            wrt.write_field(f.trim_ascii())
-                .map_err(MyErrors::CsvReadError)?
+        if raw_record.get(0).unwrap_or(b"").first() == Some(&comment_char) {
+            wrt.write_byte_record(&raw_record)
+                .map_err(MyErrors::CsvWriteError)?;
+            continue;
+        }
+
+        for field in raw_record.iter() {
+            wrt.write_field(field.trim_ascii())
+                .map_err(MyErrors::CsvWriteError)?
         }
 
         wrt.write_record(None::<&[u8]>)
-            .map_err(MyErrors::CsvReadError)?
+            .map_err(MyErrors::CsvWriteError)?
     }
     wrt.flush().map_err(MyErrors::IoWriteError)?;
 
@@ -153,6 +188,7 @@ where
 
         tmp_byte_record.clear();
         for (col, value) in raw_record.iter().enumerate() {
+            assert!(raw_record.len() <= cols_width.len());
             tmp_field.clear();
             tmp_field.extend_from_slice(value);
             tmp_field.extend_from_slice(&tmp_spaces[0..=(cols_width[col] - value.len())]);
@@ -305,40 +341,72 @@ where
     Ok(cols_width)
 }
 
-pub fn format<R: io::Read, W: io::Write>(
-    in_stream: R,
-    out_stream: W,
-    fmt_args: FmtArgs,
-) -> Result<(), MyErrors> {
+pub fn format_file<P: AsRef<Path>>(file_path: P, fmt_args: FmtArgs) -> Result<(), MyErrors> {
     let comment_char: u8 = fmt_args.comment_char as u8;
     let delimiter: u8 = fmt_args.delimiter as u8;
+    let quote_char: u8 = fmt_args.quote_char as u8;
 
-    // Build the CSV reader and iterate over each record.
+    let file_handle = File::open(&file_path)
+        .inspect_err(|err| {
+            eprintln!(
+                "Error in reading input file {:?}: {err}",
+                file_path.as_ref()
+            );
+            exit(1)
+        })
+        .unwrap();
+
+    let mmap = unsafe {
+        Mmap::map(&file_handle).expect(&format!(
+            "Error mapping file {}",
+            file_path.as_ref().display()
+        ))
+    };
+    let mmap_reader = io::Cursor::new(mmap);
     let mut rdr = csv::ReaderBuilder::new()
         .delimiter(delimiter)
         .has_headers(false)
         .flexible(true)
-        .quote(fmt_args.quote_char as u8)
+        .quote(quote_char)
         .double_quote(true)
+        .comment(Some(comment_char))
         // .terminator(Terminator::CRLF)
-        .from_reader(in_stream);
+        .from_reader(mmap_reader);
+
+    let out_stream: Box<dyn io::Write> = if let Some(file_path) = &fmt_args.output {
+        let file_handle = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(file_path)
+            .inspect_err(|err| {
+                eprintln!("Error in opening output file {:?}: {:?}", file_path, err);
+                exit(1)
+            })
+            .unwrap();
+        Box::new(file_handle)
+    } else {
+        Box::new(io::stdout().lock())
+    };
 
     let mut wrt = csv::WriterBuilder::new()
         .delimiter(delimiter)
         .has_headers(false)
         .flexible(true)
-        .quote(fmt_args.quote_char as u8)
+        .quote(quote_char)
         .quote_style(QuoteStyle::Never)
         .double_quote(true)
         // .terminator(Terminator::CRLF)
         .from_writer(out_stream);
 
-    let mut buffer: Vec<ByteRecord>;
-    let mut line_count = 0;
     let mut raw_record = ByteRecord::new();
-
     if let Some(buffer_lines) = fmt_args.buffer_lines {
-        buffer = Vec::with_capacity(buffer_lines);
+        // Buffer first x lines and check the column width on all of them,
+        // then switch to write a line as soon as it's read, without keeping it in memory.
+        // The column widths are increased if necessary when a longer field is found, but the
+        // process doe not wait for all the file to be read.
+        let mut buffer: Vec<ByteRecord> = Vec::with_capacity(buffer_lines);
+        let mut line_count = 0;
 
         while line_count < buffer_lines
             && rdr
@@ -355,8 +423,12 @@ pub fn format<R: io::Read, W: io::Write>(
 
         pad_and_write_unbuffered(&mut wrt, &mut rdr, comment_char, cols_width)?;
         wrt.flush().map_err(MyErrors::IoWriteError)?;
-    } else if fmt_args.input.is_some() {
-        let mut cols_width = vec![0; 100];
+        return Ok(());
+    } else {
+        // This way instead read the whole file in two-passes.
+        // The first computes the column width and the second formats the lines and writes them
+        let mut cols_width = vec![0; 1000];
+        let start_pos = rdr.position().clone();
         while rdr
             .read_byte_record(&mut raw_record)
             .map_err(MyErrors::CsvReadError)?
@@ -384,7 +456,75 @@ pub fn format<R: io::Read, W: io::Write>(
             }
         }
 
+        rdr.seek(start_pos).map_err(MyErrors::CsvReadError)?;
         pad_and_write_unchecked(&mut wrt, &mut rdr, comment_char, cols_width)?;
+        wrt.flush().map_err(MyErrors::IoWriteError)?;
+    }
+    Ok(())
+}
+
+pub fn format(fmt_args: FmtArgs) -> Result<(), MyErrors> {
+    let comment_char: u8 = fmt_args.comment_char as u8;
+    let delimiter: u8 = fmt_args.delimiter as u8;
+    let quote_char: u8 = fmt_args.quote_char as u8;
+
+    let mut rdr = csv::ReaderBuilder::new()
+        .delimiter(delimiter)
+        .has_headers(false)
+        .flexible(true)
+        .quote(quote_char)
+        .double_quote(true)
+        .comment(Some(comment_char))
+        // .terminator(Terminator::CRLF)
+        .from_reader(io::stdin());
+
+    let out_stream: Box<dyn io::Write> = if let Some(file_path) = &fmt_args.output {
+        let file_handle = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(file_path)
+            .inspect_err(|err| {
+                eprintln!("Error in opening output file {:?}: {:?}", file_path, err);
+                exit(1)
+            })
+            .unwrap();
+        Box::new(file_handle)
+    } else {
+        Box::new(io::stdout().lock())
+    };
+
+    let mut wrt = csv::WriterBuilder::new()
+        .delimiter(delimiter)
+        .has_headers(false)
+        .flexible(true)
+        .quote(quote_char)
+        .quote_style(QuoteStyle::Never)
+        .double_quote(true)
+        // .terminator(Terminator::CRLF)
+        .from_writer(out_stream);
+
+    let mut buffer: Vec<ByteRecord>;
+    let mut raw_record = ByteRecord::new();
+
+    if let Some(buffer_lines) = fmt_args.buffer_lines {
+        buffer = Vec::with_capacity(buffer_lines);
+
+        let mut line_count = 0;
+        while line_count < buffer_lines
+            && rdr
+                .read_byte_record(&mut raw_record)
+                .map_err(MyErrors::CsvReadError)?
+        {
+            buffer.push(raw_record.clone());
+            line_count += 1;
+        }
+
+        let cols_width = pad_and_write_buffered(&mut wrt, &buffer, comment_char)
+            .map_err(MyErrors::CsvWriteError)?;
+        wrt.flush().map_err(MyErrors::IoWriteError)?;
+
+        pad_and_write_unbuffered(&mut wrt, &mut rdr, comment_char, cols_width)?;
         wrt.flush().map_err(MyErrors::IoWriteError)?;
     } else {
         // TODO: Add saving the buffer to a file in case it exceed the memory available
@@ -403,43 +543,12 @@ pub fn format<R: io::Read, W: io::Write>(
 }
 
 pub fn process(fmt_args: FmtArgs) {
-    let in_stream: Box<dyn io::Read>;
-    if let Some(file_path) = &fmt_args.input {
-        let file_handle = match File::open(file_path) {
-            Ok(handle) => handle,
-            Err(err) => {
-                eprintln!("Error in reading file {:?}: {:?}", file_path, err);
-                exit(1);
-            }
-        };
-        in_stream = Box::new(file_handle)
-    } else {
-        in_stream = Box::new(io::stdin())
-    };
-
-    let out_stream: Box<dyn io::Write>;
-    if let Some(file_path) = &fmt_args.output {
-        let file_handle = match OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(file_path)
-        {
-            Ok(handle) => handle,
-            Err(err) => {
-                eprintln!("Error in opening output file {:?}: {:?}", file_path, err);
-                exit(1)
-            }
-        };
-        out_stream = Box::new(file_handle)
-    } else {
-        out_stream = Box::new(io::stdout().lock())
-    };
-
     let result = if fmt_args.strip {
-        strip(in_stream, out_stream, fmt_args)
+        strip(fmt_args)
+    } else if let Some(file_path) = &fmt_args.input.clone() {
+        format_file(file_path, fmt_args)
     } else {
-        format(in_stream, out_stream, fmt_args)
+        format(fmt_args)
     };
 
     if let Err(err) = result {
