@@ -192,14 +192,16 @@ where
         }
 
         tmp_byte_record.clear();
-        for (col, value) in raw_record.iter().enumerate() {
-            if cols_width[col] < value.len() {
-                cols_width[col] = value.len();
-                tmp_spaces = [b' '].repeat(tmp_spaces.len().max(value.len()));
+        for (col, field) in raw_record.iter().enumerate() {
+            // Trimmed and added 1 for the the space at the end (len gives the last index + 1)
+            let field_width = field.trim_ascii_end().len();
+            if cols_width[col] < field_width {
+                cols_width[col] = field_width;
+                tmp_spaces = [b' '].repeat(tmp_spaces.len().max(field_width));
             }
             tmp_field.clear();
-            tmp_field.extend_from_slice(value);
-            tmp_field.extend_from_slice(&tmp_spaces[0..=(cols_width[col] - value.len())]);
+            tmp_field.extend_from_slice(field);
+            tmp_field.extend_from_slice(&tmp_spaces[0..=(cols_width[col] - field.len())]);
             tmp_byte_record.push_field(&tmp_field);
         }
         wrt.write_byte_record(&tmp_byte_record)?;
@@ -227,9 +229,14 @@ where
             cols_width.resize(record.len(), 0);
         }
 
-        for (col, value) in record.iter().enumerate() {
-            if cols_width[col] < value.len() {
-                cols_width[col] = value.len()
+        // Each field is trimmed and added 1 for the the space at the end (len is the last index + 1)
+        for (col, field_width) in record
+            .iter()
+            .map(|field| field.trim_ascii_end().len())
+            .enumerate()
+        {
+            if cols_width[col] < field_width {
+                cols_width[col] = field_width
             }
         }
     }
@@ -342,9 +349,13 @@ pub fn format_file<P: AsRef<Path>>(file_path: P, fmt_args: FmtArgs) -> Result<()
                 cols_width.resize(raw_record.len(), 0);
             }
 
-            for (col, value) in raw_record.iter().enumerate() {
-                if cols_width[col] < value.len() {
-                    cols_width[col] = value.len()
+            for (col, field_width) in raw_record
+                .iter()
+                .map(|field| field.trim_ascii_end().len())
+                .enumerate()
+            {
+                if cols_width[col] < field_width {
+                    cols_width[col] = field_width
                 }
             }
         }
