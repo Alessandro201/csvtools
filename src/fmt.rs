@@ -356,7 +356,11 @@ pub fn format_file<P: AsRef<Path>>(file_path: P, fmt_args: FmtArgs) -> Result<()
     Ok(())
 }
 
-pub fn format(fmt_args: FmtArgs) -> Result<()> {
+pub fn format<R: io::Read, W: io::Write>(
+    fmt_args: FmtArgs,
+    in_stream: &mut R,
+    out_stream: &mut W,
+) -> Result<()> {
     let comment_char: u8 = fmt_args.comment_char as u8;
     let delimiter: u8 = fmt_args.delimiter as u8;
     let quote_char: u8 = fmt_args.quote_char as u8;
@@ -369,19 +373,7 @@ pub fn format(fmt_args: FmtArgs) -> Result<()> {
         .double_quote(true)
         .comment(Some(comment_char))
         // .terminator(Terminator::CRLF)
-        .from_reader(io::stdin());
-
-    let out_stream: Box<dyn io::Write> = if let Some(file_path) = &fmt_args.output {
-        let file_handle = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(file_path)
-            .with_context(|| format!("Error in opening output file {:?}", file_path))?;
-        Box::new(file_handle)
-    } else {
-        Box::new(io::stdout().lock())
-    };
+        .from_reader(in_stream);
 
     let mut wrt = csv::WriterBuilder::new()
         .delimiter(delimiter)
@@ -430,7 +422,19 @@ pub fn process(fmt_args: FmtArgs) -> anyhow::Result<()> {
     } else if let Some(file_path) = &fmt_args.input.clone() {
         format_file(file_path, fmt_args)
     } else {
-        format(fmt_args)
+        let mut in_stream = io::stdin();
+        let mut out_stream: Box<dyn io::Write> = if let Some(file_path) = &fmt_args.output {
+            let file_handle = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(file_path)
+                .with_context(|| format!("Error in opening output file {:?}", file_path))?;
+            Box::new(file_handle)
+        } else {
+            Box::new(io::stdout().lock())
+        };
+        format(fmt_args, &mut in_stream, &mut out_stream)
     };
 
     if let Err(err) = result {
@@ -445,4 +449,219 @@ pub fn process(fmt_args: FmtArgs) -> anyhow::Result<()> {
     };
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+
+    use super::*;
+
+    fn run_format(fmt_args: FmtArgs, in_stream: &[u8]) -> Result<Vec<u8>> {
+        let mut out_stream: Vec<u8> = vec![];
+        let mut in_stream = in_stream;
+        format(fmt_args, &mut in_stream, &mut out_stream)?;
+        Ok(out_stream)
+    }
+
+    #[test]
+    fn parse_comments() -> Result<()> {
+        let fmt_args = FmtArgs {
+            strip: false,
+            delimiter: ',',
+            comment_char: '#',
+            quote_char: '"',
+            buffer_fmt: None,
+            output: None,
+            input: None,
+        };
+        let in_stream: &[u8] = br#"
+        
+        # Comment1
+        # Comment2
+        "#;
+
+        let correct_out_stream: &[u8] = br#"
+        
+        # Comment1
+        # Comment2
+        "#;
+
+        let out_stream = run_format(fmt_args, in_stream)?;
+        if out_stream != correct_out_stream {
+            println!("out_stream: \n{}", String::from_utf8_lossy(&out_stream));
+            println!(
+                "correct_out_stream: \n{}",
+                String::from_utf8_lossy(correct_out_stream)
+            );
+        }
+        assert_eq!(out_stream, correct_out_stream);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_extra_fields() -> Result<()> {
+        let fmt_args = FmtArgs {
+            strip: false,
+            delimiter: ',',
+            comment_char: '#',
+            quote_char: '"',
+            buffer_fmt: None,
+            output: None,
+            input: None,
+        };
+        let in_stream: &[u8] = br#"
+        ciao1,wow 
+        ciao1 tutti,wow 
+        ciao2,gatto,extra field
+        "#;
+
+        let correct_out_stream: &[u8] = br#"
+        ciao1       ,wow
+        ciao1 tutti ,wow
+        ciao2       ,gatto ,extra field
+        "#;
+
+        let out_stream = run_format(fmt_args, in_stream)?;
+        if out_stream != correct_out_stream {
+            println!("out_stream: \n{}", String::from_utf8_lossy(&out_stream));
+            println!(
+                "correct_out_stream: \n{}",
+                String::from_utf8_lossy(correct_out_stream)
+            );
+        }
+        assert_eq!(out_stream, correct_out_stream);
+        Ok(())
+    }
+
+    #[test]
+    /// Spaces should be removed from the end of a line
+    /// Spaces between the delimiter and the next field are preserved
+    /// Spaces between the last character of a field and the next delimiter are not preserved
+    /// A space should be between the last character of a field and the next delimiter
+    fn parse_spaces() -> Result<()> {
+        let fmt_args = FmtArgs {
+            strip: false,
+            delimiter: ',',
+            comment_char: '#',
+            quote_char: '"',
+            buffer_fmt: None,
+            output: None,
+            input: None,
+        };
+        let in_stream: &[u8] = br#"
+        ciao1            ,wow 
+        ciao1 tutti,wow 
+        ciao2,   gatto
+        ciao2,   gatto   
+        "#;
+
+        let correct_out_stream: &[u8] = br#"
+        ciao1       ,wow
+        ciao1 tutti ,wow
+        ciao2       ,   gatto
+        ciao2       ,   gatto
+        "#;
+
+        let out_stream = run_format(fmt_args, in_stream)?;
+        if out_stream != correct_out_stream {
+            println!("out_stream: \n{}", String::from_utf8_lossy(&out_stream));
+            println!(
+                "correct_out_stream: \n{}",
+                String::from_utf8_lossy(correct_out_stream)
+            );
+        }
+        assert_eq!(out_stream, correct_out_stream);
+        Ok(())
+    }
+
+    #[test]
+    /// Spaces should be removed from the end of a line
+    /// Spaces between the delimiter and the next field are preserved
+    /// Spaces between the last character of a field and the next delimiter are not preserved
+    /// A space should be between the last character of a field and the next delimiter
+    fn parse_quotes() -> Result<()> {
+        let fmt_args = FmtArgs {
+            strip: false,
+            delimiter: ',',
+            comment_char: '#',
+            quote_char: '"',
+            buffer_fmt: None,
+            output: None,
+            input: None,
+        };
+        let in_stream: &[u8] = br#"
+        ciao1,"wow"
+        ciao1 "tutti,wow ",ciao
+        ciao1 "tutti,wow ", test
+        ciao2," ""  ,gatto,"
+        "#;
+
+        let correct_out_stream: &[u8] = br#"
+        ciao1              ,"wow"
+        ciao1 "tutti,wow " ,ciao
+        ciao1 "tutti,wow " , test
+        ciao2              ," ""  ,gatto,"
+        "#;
+
+        let out_stream = run_format(fmt_args, in_stream)?;
+        if out_stream != correct_out_stream {
+            println!("out_stream: \n{}", String::from_utf8_lossy(&out_stream));
+            println!(
+                "correct_out_stream: \n{}",
+                String::from_utf8_lossy(correct_out_stream)
+            );
+        }
+        assert_eq!(out_stream, correct_out_stream);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_correctly() -> Result<()> {
+        let fmt_args = FmtArgs {
+            strip: false,
+            delimiter: ',',
+            comment_char: '#',
+            quote_char: '"',
+            buffer_fmt: None,
+            output: None,
+            input: None,
+        };
+        let in_stream: &[u8] = br#"
+        # Comment1
+        # Comment2
+        ciao1              , wow      
+        ciao2, gatto, extra field
+        ciao3,,       miao_spacessss
+        ciao3, " ,  miao_spacessss"
+        ciao3, "" ,  miao_spacessss""
+        
+        # Comment2
+        
+        "#;
+
+        let correct_out_stream: &[u8] = br#"
+        # Comment1
+        # Comment2
+        ciao1 , wow
+        ciao2 , gatto                , extra field
+        ciao3 ,                      ,       miao_spacessss
+        ciao3 , " ,  miao_spacessss"
+        ciao3 , ""                   ,  miao_spacessss""
+        
+        # Comment2
+        
+        "#;
+
+        let out_stream = run_format(fmt_args, in_stream)?;
+        if out_stream != correct_out_stream {
+            println!("out_stream: \n{}", String::from_utf8_lossy(&out_stream));
+            println!(
+                "correct_out_stream: \n{}",
+                String::from_utf8_lossy(correct_out_stream)
+            );
+        }
+        assert_eq!(out_stream, correct_out_stream);
+        Ok(())
+    }
 }
