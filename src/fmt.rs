@@ -87,7 +87,7 @@ pub fn strip(fmt_args: FmtArgs) -> Result<()> {
         .flexible(true)
         .quote(quote_char)
         .double_quote(true)
-        .comment(Some(comment_char))
+        .comment(None)
         // .terminator(Terminator::CRLF)
         .from_reader(in_stream);
 
@@ -282,7 +282,7 @@ pub fn format_file<P: AsRef<Path>>(file_path: P, fmt_args: FmtArgs) -> Result<()
         .flexible(true)
         .quote(quote_char)
         .double_quote(true)
-        .comment(Some(comment_char))
+        .comment(None)
         // .terminator(Terminator::CRLF)
         .from_reader(mmap_reader);
 
@@ -371,7 +371,7 @@ pub fn format<R: io::Read, W: io::Write>(
         .flexible(true)
         .quote(quote_char)
         .double_quote(true)
-        .comment(Some(comment_char))
+        .comment(None)
         // .terminator(Terminator::CRLF)
         .from_reader(in_stream);
 
