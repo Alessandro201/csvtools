@@ -396,17 +396,14 @@ pub fn format<R: io::Read, W: io::Write>(
         // .terminator(Terminator::CRLF)
         .from_writer(out_stream);
 
-    let mut buffer: Vec<ByteRecord>;
-    let mut raw_record = ByteRecord::new();
+    let mut buffer: Vec<ByteRecord> = Vec::with_capacity(DEFAULT_BUFFER_LINES);
 
     if let Some(buffer_lines) = fmt_args.buffer_fmt {
-        buffer = Vec::with_capacity(buffer_lines);
-
-        let mut line_count = 0;
-        while line_count < buffer_lines && rdr.read_byte_record(&mut raw_record)?
-        {
-            buffer.push(raw_record.clone());
-            line_count += 1;
+        for (line_count, record) in rdr.byte_records().enumerate() {
+            if line_count > buffer_lines {
+                break;
+            }
+            buffer.push(record?);
         }
 
         let cols_width = pad_and_write_buffered(&mut wrt, &buffer, comment_char)?;
@@ -416,9 +413,8 @@ pub fn format<R: io::Read, W: io::Write>(
         wrt.flush()?;
     } else {
         // TODO: Add saving the buffer to a file in case it exceed the memory available
-        buffer = Vec::new();
-        while rdr.read_byte_record(&mut raw_record)? {
-            buffer.push(raw_record.clone())
+        for record in rdr.byte_records() {
+            buffer.push(record?);
         }
         pad_and_write_buffered(&mut wrt, &buffer, comment_char)?;
         wrt.flush()?;
