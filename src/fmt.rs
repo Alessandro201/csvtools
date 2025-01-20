@@ -483,16 +483,14 @@ mod tests {
             input: None,
         };
         let in_stream: &[u8] = br#"
-        
-        # Comment1
-        # Comment2
-        "#;
 
-        let correct_out_stream: &[u8] = br#"
-        
-        # Comment1
-        # Comment2
-        "#;
+# Comment1
+# Comment2  
+"#;
+
+        let correct_out_stream: &[u8] = br#"# Comment1
+# Comment2  
+"#;
 
         let out_stream = run_format(fmt_args, in_stream)?;
         if out_stream != correct_out_stream {
@@ -518,16 +516,15 @@ mod tests {
             input: None,
         };
         let in_stream: &[u8] = br#"
-        ciao1,wow 
-        ciao1 tutti,wow 
-        ciao2,gatto,extra field
-        "#;
+ciao1,wow 
+ciao1 tutti,wow 
+ciao2,gatto,extra field
+"#;
 
-        let correct_out_stream: &[u8] = br#"
-        ciao1       ,wow
-        ciao1 tutti ,wow
-        ciao2       ,gatto ,extra field
-        "#;
+        let correct_out_stream: &[u8] = br#"ciao1       ,wow 
+ciao1 tutti ,wow 
+ciao2       ,gatto ,extra field 
+"#;
 
         let out_stream = run_format(fmt_args, in_stream)?;
         if out_stream != correct_out_stream {
@@ -542,10 +539,11 @@ mod tests {
     }
 
     #[test]
-    /// Spaces should be removed from the end of a line
+    /// Only a space should be left at the end of a line
     /// Spaces between the delimiter and the next field are preserved
     /// Spaces between the last character of a field and the next delimiter are not preserved
     /// A space should be between the last character of a field and the next delimiter
+    /// Empty lines and lines with just spaces should be removed
     fn parse_spaces() -> Result<()> {
         let fmt_args = FmtArgs {
             strip: false,
@@ -557,18 +555,19 @@ mod tests {
             input: None,
         };
         let in_stream: &[u8] = br#"
-        ciao1            ,wow 
-        ciao1 tutti,wow 
-        ciao2,   gatto
-        ciao2,   gatto   
-        "#;
 
-        let correct_out_stream: &[u8] = br#"
-        ciao1       ,wow
-        ciao1 tutti ,wow
-        ciao2       ,   gatto
-        ciao2       ,   gatto
-        "#;
+ciao1            ,wow 
+ciao1 tutti,wow 
+ciao2,   gatto
+ciao2,   gatto   
+            
+"#;
+
+        let correct_out_stream: &[u8] = br#"ciao1       ,wow 
+ciao1 tutti ,wow 
+ciao2       ,   gatto 
+ciao2       ,   gatto 
+"#;
 
         let out_stream = run_format(fmt_args, in_stream)?;
         if out_stream != correct_out_stream {
@@ -583,10 +582,6 @@ mod tests {
     }
 
     #[test]
-    /// Spaces should be removed from the end of a line
-    /// Spaces between the delimiter and the next field are preserved
-    /// Spaces between the last character of a field and the next delimiter are not preserved
-    /// A space should be between the last character of a field and the next delimiter
     fn parse_quotes() -> Result<()> {
         let fmt_args = FmtArgs {
             strip: false,
@@ -598,18 +593,17 @@ mod tests {
             input: None,
         };
         let in_stream: &[u8] = br#"
-        ciao1,"wow"
-        ciao1 "tutti,wow ",ciao
-        ciao1 "tutti,wow ", test
-        ciao2," ""  ,gatto,"
-        "#;
+ciao1,"wow"
+ciao1 "tutti,wow ",ciao
+ciao1 "tutti,wow ", test
+ciao2," ""  ,gatto,"
+"#;
 
-        let correct_out_stream: &[u8] = br#"
-        ciao1              ,"wow"
-        ciao1 "tutti,wow " ,ciao
-        ciao1 "tutti,wow " , test
-        ciao2              ," ""  ,gatto,"
-        "#;
+        let correct_out_stream: &[u8] = br#"ciao1              ,"wow" 
+ciao1 "tutti,wow " ,ciao 
+ciao1 "tutti,wow " , test 
+ciao2              ," ""  ,gatto," 
+"#;
 
         let out_stream = run_format(fmt_args, in_stream)?;
         if out_stream != correct_out_stream {
