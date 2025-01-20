@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const DEFAULT_BUFFER_LINES: usize = 1024 * 16;
+const DEFAULT_BUFFER_LINES: usize = 1024;
 lazy_static! {
     static ref DEFAULT_BUFFER_LINES_STR: String = DEFAULT_BUFFER_LINES.to_string();
 }
