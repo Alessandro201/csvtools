@@ -2,6 +2,7 @@ use anyhow::{bail, Context, Result};
 use clap::{ArgAction, Args};
 use csv::{self, ByteRecord, QuoteStyle};
 use lazy_static::lazy_static;
+use log::debug;
 use memmap::Mmap;
 use rand::{distributions::Alphanumeric, Rng};
 use std::{
@@ -119,7 +120,7 @@ pub fn strip(fmt_args: &FmtArgs) -> Result<()> {
         .has_headers(false)
         .flexible(true)
         .quote(quote_char)
-        .quote_style(QuoteStyle::Never)
+        .quote_style(QuoteStyle::Necessary)
         .double_quote(true)
         // .terminator(Terminator::CRLF)
         .from_writer(out_stream);
@@ -162,13 +163,23 @@ where
             wrt.write_byte_record(&raw_record)?;
             continue;
         }
+        // Skip empty lines or filled with only spaces
+        if raw_record.len() <= 1 && raw_record.get(1).unwrap_or(b"").trim_ascii().is_empty() {
+            continue;
+        }
 
         tmp_byte_record.clear();
-        for (col, value) in raw_record.iter().enumerate() {
+        for (col, field) in raw_record
+            .iter()
+            .map(|field| field.trim_ascii_end())
+            .enumerate()
+        {
             assert!(raw_record.len() <= cols_width.len());
             tmp_field.clear();
-            tmp_field.extend_from_slice(value);
-            tmp_field.extend_from_slice(&tmp_spaces[0..=(cols_width[col] - value.len())]);
+            tmp_field.extend_from_slice(field);
+            if col != raw_record.len() - 1 {
+                tmp_field.extend_from_slice(&tmp_spaces[0..(cols_width[col] - field.len())]);
+            }
             tmp_byte_record.push_field(&tmp_field);
         }
         wrt.write_byte_record(&tmp_byte_record)?
@@ -198,21 +209,33 @@ where
             continue;
         }
 
+        // Skip empty lines or filled with only spaces
+        if raw_record.len() <= 1 && raw_record.get(1).unwrap_or(b"").trim_ascii().is_empty() {
+            continue;
+        }
+
         if raw_record.len() > cols_width.len() {
             cols_width.resize(raw_record.len(), 0);
         }
 
         tmp_byte_record.clear();
-        for (col, field) in raw_record.iter().enumerate() {
-            // Trimmed and added 1 for the the space at the end (len gives the last index + 1)
-            let field_width = field.trim_ascii_end().len();
-            if cols_width[col] < field_width {
-                cols_width[col] = field_width;
+        for (col, field) in raw_record
+            .iter()
+            .map(|field| field.trim_ascii_end())
+            .enumerate()
+        {
+            // Trimmed and added 1 for the the space at the end
+            let field_width = field.len();
+            if cols_width[col] < field_width + 1 {
+                cols_width[col] = field_width + 1;
                 tmp_spaces = [b' '].repeat(tmp_spaces.len().max(field_width));
             }
             tmp_field.clear();
             tmp_field.extend_from_slice(field);
-            tmp_field.extend_from_slice(&tmp_spaces[0..=(cols_width[col] - field.len())]);
+            // if the field is the last, just add a space at the end
+            if col != raw_record.len() - 1 {
+                tmp_field.extend_from_slice(&tmp_spaces[0..(cols_width[col] - field.len())]);
+            }
             tmp_byte_record.push_field(&tmp_field);
         }
         wrt.write_byte_record(&tmp_byte_record)?;
@@ -240,10 +263,10 @@ where
             cols_width.resize(record.len(), 0);
         }
 
-        // Each field is trimmed and added 1 for the the space at the end (len is the last index + 1)
+        // Each field is trimmed and added 1 for the the space at the end
         for (col, field_width) in record
             .iter()
-            .map(|field| field.trim_ascii_end().len())
+            .map(|field| field.trim_ascii_end().len() + 1)
             .enumerate()
         {
             if cols_width[col] < field_width {
@@ -261,6 +284,11 @@ where
             continue;
         }
 
+        // Skip empty lines or filled with only spaces
+        if record.len() <= 1 && record.get(1).unwrap_or(b"").trim_ascii().is_empty() {
+            continue;
+        }
+
         // for (col, value) in record.iter().enumerate() {
         //     tmp_field.clear();
         //     tmp_field.extend_from_slice(value);
@@ -270,10 +298,17 @@ where
         // wrt.write_record(None::<&[u8]>)?;
 
         tmp_byte_record.clear();
-        for (col, value) in record.iter().enumerate() {
+        for (col, field) in record
+            .iter()
+            .map(|field| field.trim_ascii_end())
+            .enumerate()
+        {
             tmp_field.clear();
-            tmp_field.extend_from_slice(value);
-            tmp_field.extend_from_slice(&tmp_spaces[0..=(cols_width[col] - value.len())]);
+            tmp_field.extend_from_slice(field);
+            // if the field is the last, just add a space at the end
+            if col != record.len() - 1 {
+                tmp_field.extend_from_slice(&tmp_spaces[0..(cols_width[col] - field.len())]);
+            }
             tmp_byte_record.push_field(&tmp_field);
         }
         wrt.write_byte_record(&tmp_byte_record)?;
@@ -298,8 +333,8 @@ pub fn format_file<P: AsRef<Path>>(file_path: P, fmt_args: &FmtArgs) -> Result<(
         .with_context(|| format!("Error in opening input file {:?}", file_path.as_ref()))?;
 
     let mmap = unsafe {
-        Mmap::map(&file_handle).unwrap_or_else(|_| panic!("Error mapping file {}",
-            file_path.as_ref().display()))
+        Mmap::map(&file_handle)
+            .unwrap_or_else(|_| panic!("Error mapping file {}", file_path.as_ref().display()))
     };
     let mmap_reader = io::Cursor::new(mmap);
     let mut rdr = csv::ReaderBuilder::new()
@@ -329,7 +364,7 @@ pub fn format_file<P: AsRef<Path>>(file_path: P, fmt_args: &FmtArgs) -> Result<(
         .has_headers(false)
         .flexible(true)
         .quote(quote_char)
-        .quote_style(QuoteStyle::Never)
+        .quote_style(QuoteStyle::Necessary)
         .double_quote(true)
         // .terminator(Terminator::CRLF)
         .from_writer(out_stream);
@@ -368,9 +403,10 @@ pub fn format_file<P: AsRef<Path>>(file_path: P, fmt_args: &FmtArgs) -> Result<(
                 cols_width.resize(raw_record.len(), 0);
             }
 
+            // Trimmed and added 1 for the the space at the end
             for (col, field_width) in raw_record
                 .iter()
-                .map(|field| field.trim_ascii_end().len())
+                .map(|field| field.trim_ascii_end().len() + 1)
                 .enumerate()
             {
                 if cols_width[col] < field_width {
@@ -410,7 +446,7 @@ pub fn format<R: io::Read, W: io::Write>(
         .has_headers(false)
         .flexible(true)
         .quote(quote_char)
-        .quote_style(QuoteStyle::Never)
+        .quote_style(QuoteStyle::Necessary)
         .double_quote(true)
         // .terminator(Terminator::CRLF)
         .from_writer(out_stream);
@@ -433,7 +469,8 @@ pub fn format<R: io::Read, W: io::Write>(
     } else {
         // TODO: Add saving the buffer to a file in case it exceed the memory available
         for record in rdr.byte_records() {
-            buffer.push(record?);
+            let record = record?;
+            buffer.push(record);
         }
         pad_and_write_buffered(&mut wrt, &buffer, comment_char)?;
         wrt.flush()?;
@@ -445,6 +482,7 @@ pub fn format<R: io::Read, W: io::Write>(
 pub fn process(fmt_args: FmtArgs) -> anyhow::Result<()> {
     fmt_args.check_args()?;
     debug!("{:#?}", &fmt_args);
+
     let output_file: Option<PathBuf> = if fmt_args.output.is_some() {
         fmt_args.output.clone()
     } else if fmt_args.input.is_some() && fmt_args.in_place {
@@ -579,15 +617,16 @@ mod tests {
         let in_stream: &[u8] = br#"
 
 # Comment1
-# Comment2  
+# Comment2   
 "#;
 
         let correct_out_stream: &[u8] = br#"# Comment1
-# Comment2  
+# Comment2   
 "#;
 
         let out_stream = run_format(fmt_args, in_stream)?;
         if out_stream != correct_out_stream {
+            println!("in_stream: \n{}", String::from_utf8_lossy(in_stream));
             println!("out_stream: \n{}", String::from_utf8_lossy(&out_stream));
             println!(
                 "correct_out_stream: \n{}",
@@ -657,17 +696,20 @@ ciao1            ,wow
 ciao1 tutti,wow 
 ciao2,   gatto
 ciao2,   gatto   
-            
+                        
+                        
+                        
 "#;
 
-        let correct_out_stream: &[u8] = br#"ciao1       ,wow 
-ciao1 tutti ,wow 
-ciao2       ,   gatto 
-ciao2       ,   gatto 
+        let correct_out_stream: &[u8] = br#"ciao1       ,wow
+ciao1 tutti ,wow
+ciao2       ,   gatto
+ciao2       ,   gatto
 "#;
 
         let out_stream = run_format(fmt_args, in_stream)?;
         if out_stream != correct_out_stream {
+            println!("in_stream: \n{}", String::from_utf8_lossy(in_stream));
             println!("out_stream: \n{}", String::from_utf8_lossy(&out_stream));
             println!(
                 "correct_out_stream: \n{}",
@@ -692,19 +734,20 @@ ciao2       ,   gatto
         };
         let in_stream: &[u8] = br#"
 ciao1,"wow"
-ciao1 "tutti,wow ",ciao
-ciao1 "tutti,wow ", test
+"ciao1 tutti,wow ",ciao
+"ciao1 tutti,wow ", test
 ciao2," ""  ,gatto,"
 "#;
 
-        let correct_out_stream: &[u8] = br#"ciao1              ,"wow" 
-ciao1 "tutti,wow " ,ciao 
-ciao1 "tutti,wow " , test 
-ciao2              ," ""  ,gatto," 
+        let correct_out_stream: &[u8] = br#"ciao1              ,"wow"
+"ciao1 tutti,wow " ,ciao
+"ciao1 tutti,wow " , test
+ciao2              ," ""  ,gatto,"
 "#;
 
         let out_stream = run_format(fmt_args, in_stream)?;
         if out_stream != correct_out_stream {
+            println!("in_stream: \n{}", String::from_utf8_lossy(in_stream));
             println!("out_stream: \n{}", String::from_utf8_lossy(&out_stream));
             println!(
                 "correct_out_stream: \n{}",
@@ -728,33 +771,31 @@ ciao2              ," ""  ,gatto,"
             input: None,
         };
         let in_stream: &[u8] = br#"
-        # Comment1
-        # Comment2
-        ciao1              , wow      
-        ciao2, gatto, extra field
-        ciao3,,       miao_spacessss
-        ciao3, " ,  miao_spacessss"
-        ciao3, "" ,  miao_spacessss""
-        
-        # Comment2
-        
-        "#;
+# Comment1
+# Comment2
+ciao1              , wow      
+ciao2, gatto, extra field
+ciao3,,       miao_spacessss
+ciao3," ,  miao_spacessss"        
+ciao3,"" ,  miao_spacessss
 
-        let correct_out_stream: &[u8] = br#"
-        # Comment1
-        # Comment2
-        ciao1 , wow
-        ciao2 , gatto                , extra field
-        ciao3 ,                      ,       miao_spacessss
-        ciao3 , " ,  miao_spacessss"
-        ciao3 , ""                   ,  miao_spacessss""
-        
-        # Comment2
-        
-        "#;
+# Comment2
+
+"#;
+
+        let correct_out_stream: &[u8] = br#"# Comment1
+# Comment2
+ciao1 , wow
+ciao2 , gatto               , extra field
+ciao3 ,                     ,       miao_spacessss
+ciao3 ," ,  miao_spacessss"
+ciao3 ,                     ,  miao_spacessss
+# Comment2
+"#;
 
         let out_stream = run_format(fmt_args, in_stream)?;
         if out_stream != correct_out_stream {
+            println!("in_stream: \n{}", String::from_utf8_lossy(in_stream));
             println!("out_stream: \n{}", String::from_utf8_lossy(&out_stream));
             println!(
                 "correct_out_stream: \n{}",
