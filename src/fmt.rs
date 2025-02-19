@@ -3,8 +3,9 @@ use clap::{ArgAction, Args};
 use csv::{self, ByteRecord, QuoteStyle};
 use lazy_static::lazy_static;
 use memmap::Mmap;
+use rand::{distributions::Alphanumeric, Rng};
 use std::{
-    fs::{File, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{self},
     path::{Path, PathBuf},
 };
@@ -39,18 +40,27 @@ pub struct FmtArgs {
     #[arg(short, long, default_missing_value = DEFAULT_BUFFER_LINES_STR.as_str(), required=false, require_equals=true, num_args=0..=1, value_parser = clap::value_parser!(usize))]
     buffer_fmt: Option<usize>,
 
-    /*
-        /// Apply the formatting in place. Works only if an input is provided.
-        /// Keep in mind that a new temporary file will be created, and then renamed
-        #[arg(short, long, action=ArgAction::SetTrue)]
-        in_place: bool,
-    */
-    /// Save the output to a file
+    /// Apply the formatting in place. Works only if an input is provided.
+    /// Keep in mind that a new temporary file will be created, and then renamed.
+    #[arg(short, long, action=ArgAction::SetTrue)]
+    in_place: bool,
     #[arg(short, long, value_parser=clap::value_parser!(PathBuf))]
     output: Option<PathBuf>,
 
     #[arg(value_name = "FILE")]
     input: Option<PathBuf>,
+}
+
+impl FmtArgs {
+    fn check_args(&self) -> anyhow::Result<()> {
+        if self.output.is_some() && self.in_place {
+            bail!("You cannot pass both --output and --in-place");
+        }
+        if self.in_place && self.input.is_none() {
+            bail!("You cannot pass --in-place flag if the input is not a file");
+        }
+        Ok(())
+    }
 }
 
 #[inline]
@@ -67,12 +77,12 @@ fn is_comment(record: &csv::ByteRecord, comment_char: u8) -> bool {
     record.get(0).unwrap_or(b"").first() == Some(&comment_char)
 }
 
-pub fn strip(fmt_args: FmtArgs) -> Result<()> {
+pub fn strip(fmt_args: &FmtArgs) -> Result<()> {
     let comment_char: u8 = fmt_args.comment_char as u8;
     let delimiter: u8 = fmt_args.delimiter as u8;
     let quote_char: u8 = fmt_args.quote_char as u8;
 
-    let in_stream: Box<dyn io::Read> = if let Some(in_path) = fmt_args.input {
+    let in_stream: Box<dyn io::Read> = if let Some(in_path) = fmt_args.input.clone() {
         let file_handle = File::open(&in_path)
             .with_context(|| format!("Error in opening input file {:?}", in_path))?;
         Box::new(file_handle)
@@ -270,7 +280,7 @@ where
     Ok(cols_width)
 }
 
-pub fn format_file<P: AsRef<Path>>(file_path: P, fmt_args: FmtArgs) -> Result<()> {
+pub fn format_file<P: AsRef<Path>>(file_path: P, fmt_args: &FmtArgs) -> Result<()> {
     let comment_char: u8 = fmt_args.comment_char as u8;
     let delimiter: u8 = fmt_args.delimiter as u8;
     let quote_char: u8 = fmt_args.quote_char as u8;
@@ -368,7 +378,7 @@ pub fn format_file<P: AsRef<Path>>(file_path: P, fmt_args: FmtArgs) -> Result<()
 }
 
 pub fn format<R: io::Read, W: io::Write>(
-    fmt_args: FmtArgs,
+    fmt_args: &FmtArgs,
     in_stream: &mut R,
     out_stream: &mut W,
 ) -> Result<()> {
@@ -424,24 +434,52 @@ pub fn format<R: io::Read, W: io::Write>(
 }
 
 pub fn process(fmt_args: FmtArgs) -> anyhow::Result<()> {
+    fmt_args.check_args()?;
+    debug!("{:#?}", &fmt_args);
+    let output_file: Option<PathBuf> = if fmt_args.output.is_some() {
+        fmt_args.output.clone()
+    } else if fmt_args.input.is_some() && fmt_args.in_place {
+        let mut random_name: String = rand::thread_rng()
+            .sample_iter(&Alphanumeric)
+            .take(30)
+            .map(char::from)
+            .collect();
+        let mut output_file = fmt_args
+            .input
+            .as_ref()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(&random_name);
+
+        while output_file.exists() {
+            random_name.push('x');
+            output_file.set_file_name(&random_name);
+        }
+        Some(output_file)
+    } else {
+        None
+    };
+
+    let mut out_stream: Box<dyn io::Write> = if let Some(ref output_file) = output_file {
+        let file_handle = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(output_file)
+            .with_context(|| format!("Error in opening output file {:?}", output_file))?;
+        Box::new(file_handle)
+    } else {
+        Box::new(io::stdout().lock())
+    };
+
     let result = if fmt_args.strip {
-        strip(fmt_args)
+        strip(&fmt_args)
     } else if let Some(file_path) = &fmt_args.input.clone() {
-        format_file(file_path, fmt_args)
+        format_file(file_path, &fmt_args)
     } else {
         let mut in_stream = io::stdin();
-        let mut out_stream: Box<dyn io::Write> = if let Some(file_path) = &fmt_args.output {
-            let file_handle = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(file_path)
-                .with_context(|| format!("Error in opening output file {:?}", file_path))?;
-            Box::new(file_handle)
-        } else {
-            Box::new(io::stdout().lock())
-        };
-        format(fmt_args, &mut in_stream, &mut out_stream)
+        format(&fmt_args, &mut in_stream, &mut out_stream)
     };
 
     if let Err(err) = result {
@@ -455,19 +493,65 @@ pub fn process(fmt_args: FmtArgs) -> anyhow::Result<()> {
         };
     };
 
+    if fmt_args.input.is_some() && fmt_args.in_place {
+        let res = fs::rename(
+            output_file.expect("Output_file should have been set before"),
+            fmt_args.input.clone().unwrap(),
+        );
+        if let Err(err) = res {
+            bail!(err)
+        }
+    }
+
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use anyhow::Result;
 
     use super::*;
 
+    #[test]
+    fn check_arguments() -> Result<()> {
+        let mut fmt_args = FmtArgs {
+            strip: false,
+            in_place: true,
+            delimiter: Some(','),
+            comment_char: '#',
+            quote_char: '"',
+            buffer_fmt: None,
+            output: None,
+            input: None,
+        };
+
+        // Input cannot be None if in_place is true
+        fmt_args.input = None;
+        fmt_args.output = None;
+        fmt_args.in_place = true;
+        assert!(fmt_args.check_args().is_err());
+
+        // Output cannot be Some if in_place is true
+        fmt_args.input = Some(PathBuf::from_str("test").unwrap());
+        fmt_args.output = Some(PathBuf::from_str("test").unwrap());
+        fmt_args.in_place = true;
+        assert!(fmt_args.check_args().is_err());
+
+        // Input is some and in_place is true -> Ok
+        fmt_args.input = Some(PathBuf::from_str("test").unwrap());
+        fmt_args.output = None;
+        fmt_args.in_place = true;
+        assert!(fmt_args.check_args().is_ok());
+
+        Ok(())
+    }
+
     fn run_format(fmt_args: FmtArgs, in_stream: &[u8]) -> Result<Vec<u8>> {
         let mut out_stream: Vec<u8> = vec![];
         let mut in_stream = in_stream;
-        format(fmt_args, &mut in_stream, &mut out_stream)?;
+        format(&fmt_args, &mut in_stream, &mut out_stream)?;
         Ok(out_stream)
     }
 
@@ -476,6 +560,7 @@ mod tests {
         let fmt_args = FmtArgs {
             strip: false,
             delimiter: ',',
+            in_place: false,
             comment_char: '#',
             quote_char: '"',
             buffer_fmt: None,
@@ -509,6 +594,7 @@ mod tests {
         let fmt_args = FmtArgs {
             strip: false,
             delimiter: ',',
+            in_place: false,
             comment_char: '#',
             quote_char: '"',
             buffer_fmt: None,
@@ -548,6 +634,7 @@ ciao2       ,gatto ,extra field
         let fmt_args = FmtArgs {
             strip: false,
             delimiter: ',',
+            in_place: false,
             comment_char: '#',
             quote_char: '"',
             buffer_fmt: None,
@@ -586,6 +673,7 @@ ciao2       ,   gatto
         let fmt_args = FmtArgs {
             strip: false,
             delimiter: ',',
+            in_place: false,
             comment_char: '#',
             quote_char: '"',
             buffer_fmt: None,
@@ -622,6 +710,7 @@ ciao2              ," ""  ,gatto,"
         let fmt_args = FmtArgs {
             strip: false,
             delimiter: ',',
+            in_place: false,
             comment_char: '#',
             quote_char: '"',
             buffer_fmt: None,
