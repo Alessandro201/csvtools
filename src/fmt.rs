@@ -10,6 +10,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+const DEFAULT_DELIMITER: char = '\t';
 const DEFAULT_BUFFER_LINES: usize = 1024;
 lazy_static! {
     static ref DEFAULT_BUFFER_LINES_STR: String = DEFAULT_BUFFER_LINES.to_string();
@@ -22,9 +23,9 @@ pub struct FmtArgs {
     #[arg(short, long, action=ArgAction::SetTrue)]
     strip: bool,
 
-    /// Delimiter to use to parse the tabular data
-    #[arg(short, long, default_value_t = '\t', required = false, value_parser=parse_char)]
-    delimiter: char,
+    /// Delimiter to use to parse the tabular data. Default=\t for any file other than .csv
+    #[arg(short, long, required = false, value_parser=parse_char)]
+    delimiter: Option<char>,
 
     /// Lines starting with this character will be ingored
     #[arg(short, long, default_value_t = '#', required = false)]
@@ -79,7 +80,7 @@ fn is_comment(record: &csv::ByteRecord, comment_char: u8) -> bool {
 
 pub fn strip(fmt_args: &FmtArgs) -> Result<()> {
     let comment_char: u8 = fmt_args.comment_char as u8;
-    let delimiter: u8 = fmt_args.delimiter as u8;
+    let delimiter: u8 = fmt_args.delimiter.unwrap_or(DEFAULT_DELIMITER) as u8;
     let quote_char: u8 = fmt_args.quote_char as u8;
 
     let in_stream: Box<dyn io::Read> = if let Some(in_path) = fmt_args.input.clone() {
@@ -282,8 +283,16 @@ where
 
 pub fn format_file<P: AsRef<Path>>(file_path: P, fmt_args: &FmtArgs) -> Result<()> {
     let comment_char: u8 = fmt_args.comment_char as u8;
-    let delimiter: u8 = fmt_args.delimiter as u8;
     let quote_char: u8 = fmt_args.quote_char as u8;
+    let delimiter: u8;
+
+    if fmt_args.delimiter.is_some() {
+        delimiter = fmt_args.delimiter.unwrap() as u8;
+    } else if file_path.as_ref().extension().is_some_and(|e| e == "csv") {
+        delimiter = ',' as u8;
+    } else {
+        delimiter = DEFAULT_DELIMITER as u8;
+    }
 
     let file_handle = File::open(&file_path)
         .with_context(|| format!("Error in opening input file {:?}", file_path.as_ref()))?;
@@ -383,8 +392,8 @@ pub fn format<R: io::Read, W: io::Write>(
     out_stream: &mut W,
 ) -> Result<()> {
     let comment_char: u8 = fmt_args.comment_char as u8;
-    let delimiter: u8 = fmt_args.delimiter as u8;
     let quote_char: u8 = fmt_args.quote_char as u8;
+    let delimiter: u8 = fmt_args.delimiter.unwrap_or(DEFAULT_DELIMITER) as u8;
 
     let mut rdr = csv::ReaderBuilder::new()
         .delimiter(delimiter)
@@ -559,8 +568,8 @@ mod tests {
     fn parse_comments() -> Result<()> {
         let fmt_args = FmtArgs {
             strip: false,
-            delimiter: ',',
             in_place: false,
+            delimiter: Some(','),
             comment_char: '#',
             quote_char: '"',
             buffer_fmt: None,
@@ -593,8 +602,8 @@ mod tests {
     fn parse_extra_fields() -> Result<()> {
         let fmt_args = FmtArgs {
             strip: false,
-            delimiter: ',',
             in_place: false,
+            delimiter: Some(','),
             comment_char: '#',
             quote_char: '"',
             buffer_fmt: None,
@@ -602,18 +611,19 @@ mod tests {
             input: None,
         };
         let in_stream: &[u8] = br#"
-ciao1,wow 
-ciao1 tutti,wow 
+ciao1,wow
+ciao1 tutti,wow
 ciao2,gatto,extra field
 "#;
 
-        let correct_out_stream: &[u8] = br#"ciao1       ,wow 
-ciao1 tutti ,wow 
-ciao2       ,gatto ,extra field 
+        let correct_out_stream: &[u8] = br#"ciao1       ,wow
+ciao1 tutti ,wow
+ciao2       ,gatto ,extra field
 "#;
 
         let out_stream = run_format(fmt_args, in_stream)?;
         if out_stream != correct_out_stream {
+            println!("in_stream: \n{}", String::from_utf8_lossy(in_stream));
             println!("out_stream: \n{}", String::from_utf8_lossy(&out_stream));
             println!(
                 "correct_out_stream: \n{}",
@@ -633,8 +643,8 @@ ciao2       ,gatto ,extra field
     fn parse_spaces() -> Result<()> {
         let fmt_args = FmtArgs {
             strip: false,
-            delimiter: ',',
             in_place: false,
+            delimiter: Some(','),
             comment_char: '#',
             quote_char: '"',
             buffer_fmt: None,
@@ -672,8 +682,8 @@ ciao2       ,   gatto
     fn parse_quotes() -> Result<()> {
         let fmt_args = FmtArgs {
             strip: false,
-            delimiter: ',',
             in_place: false,
+            delimiter: Some(','),
             comment_char: '#',
             quote_char: '"',
             buffer_fmt: None,
@@ -709,8 +719,8 @@ ciao2              ," ""  ,gatto,"
     fn parse_correctly() -> Result<()> {
         let fmt_args = FmtArgs {
             strip: false,
-            delimiter: ',',
             in_place: false,
+            delimiter: Some(','),
             comment_char: '#',
             quote_char: '"',
             buffer_fmt: None,
