@@ -46,6 +46,13 @@ pub struct FmtArgs {
     /// Keep in mind that a new temporary file will be created, and then renamed.
     #[arg(short, long, action=ArgAction::SetTrue)]
     in_place: bool,
+
+    /// Needed to properly format UTF-8 data. The default is to treat the data as just bytes
+    /// because it's much faster
+    #[arg(short, long, action=ArgAction::SetTrue)]
+    utf8: bool,
+
+    // Save the output to a file
     #[arg(short, long, value_parser=clap::value_parser!(PathBuf))]
     output: Option<PathBuf>,
 
