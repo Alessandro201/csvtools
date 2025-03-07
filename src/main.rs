@@ -66,7 +66,7 @@ fn main() -> Result<()> {
 
     debug!("{:#?}", &args);
     match args.command {
-        Some(Commands::Fmt(fmt_args)) => fmt::process(fmt_args)?,
+        Some(Commands::Fmt(fmt_args)) => fmt::run(fmt_args)?,
         None => {}
     }
 

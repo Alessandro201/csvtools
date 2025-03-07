@@ -323,7 +323,11 @@ where
     Ok(cols_width)
 }
 
-pub fn format_file<P: AsRef<Path>>(file_path: P, fmt_args: &FmtArgs) -> Result<()> {
+pub fn format_file<P: AsRef<Path>, W: io::Write>(
+    fmt_args: &FmtArgs,
+    file_path: P,
+    out_stream: &mut W,
+) -> Result<()> {
     let comment_char: u8 = fmt_args.comment_char as u8;
     let quote_char: u8 = fmt_args.quote_char as u8;
     let delimiter: u8;
@@ -353,18 +357,6 @@ pub fn format_file<P: AsRef<Path>>(file_path: P, fmt_args: &FmtArgs) -> Result<(
         .comment(None)
         // .terminator(Terminator::CRLF)
         .from_reader(mmap_reader);
-
-    let out_stream: Box<dyn io::Write> = if let Some(file_path) = &fmt_args.output {
-        let file_handle = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(file_path)
-            .with_context(|| format!("Error in opening output file {:?}", file_path))?;
-        Box::new(file_handle)
-    } else {
-        Box::new(io::stdout().lock())
-    };
 
     let mut wrt = csv::WriterBuilder::new()
         .delimiter(delimiter)
@@ -486,11 +478,9 @@ pub fn format<R: io::Read, W: io::Write>(
     Ok(())
 }
 
-pub fn process(fmt_args: FmtArgs) -> anyhow::Result<()> {
-    fmt_args.check_args()?;
-    debug!("{:#?}", &fmt_args);
-
-    let output_file: Option<PathBuf> = if fmt_args.output.is_some() {
+/// Depending on the format_args decide if and which file is the output
+fn get_output_dest(fmt_args: &FmtArgs) -> Option<PathBuf> {
+    let output_file = if fmt_args.output.is_some() {
         fmt_args.output.clone()
     } else if fmt_args.input.is_some() && fmt_args.in_place {
         let mut random_name: String = rand::thread_rng()
@@ -515,22 +505,44 @@ pub fn process(fmt_args: FmtArgs) -> anyhow::Result<()> {
         None
     };
 
-    let mut out_stream: Box<dyn io::Write> = if let Some(ref output_file) = output_file {
+    return output_file;
+}
+
+/// If an output file is given open it, otherwise acquire a lock to stdout
+fn get_out_stream(out_file: Option<&PathBuf>) -> Result<Box<dyn io::Write>> {
+    let out_stream: Box<dyn io::Write> = if let Some(ref output_file) = out_file {
         let file_handle = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .open(output_file)
-            .with_context(|| format!("Error in opening output file {:?}", output_file))?;
+            .context(format!("Error in opening output file {:?}", output_file))?;
         Box::new(file_handle)
     } else {
         Box::new(io::stdout().lock())
     };
+    Ok(out_stream)
+}
+
+pub fn run(fmt_args: FmtArgs) -> anyhow::Result<()> {
+    fmt_args.check_args()?;
+    debug!("{:#?}", &fmt_args);
+
+    let out_file: Option<PathBuf> = get_output_dest(&fmt_args);
+    let mut out_stream: Box<dyn io::Write> = get_out_stream(out_file.as_ref())?;
+
+    if fmt_args.in_place {
+        assert!(fmt_args.output.is_none());
+        assert!(fmt_args.input.is_some());
+
+        // There should be a file to write to that will then be renamed as the original file
+        assert!(out_file.is_some());
+    }
 
     let result = if fmt_args.strip {
         strip(&fmt_args)
-    } else if let Some(file_path) = &fmt_args.input.clone() {
-        format_file(file_path, &fmt_args)
+    } else if let Some(file_path) = &fmt_args.input {
+        format_file(&fmt_args, file_path, &mut out_stream)
     } else {
         let mut in_stream = io::stdin();
         format(&fmt_args, &mut in_stream, &mut out_stream)
@@ -547,14 +559,19 @@ pub fn process(fmt_args: FmtArgs) -> anyhow::Result<()> {
         };
     };
 
-    if fmt_args.input.is_some() && fmt_args.in_place {
-        let res = fs::rename(
-            output_file.expect("Output_file should have been set before"),
-            fmt_args.input.clone().unwrap(),
-        );
-        if let Err(err) = res {
-            bail!(err)
-        }
+    // In case the --in-place flag was given overwrite the original file with the temporary one
+    if fmt_args.in_place {
+        let in_file = &fmt_args
+            .input
+            .expect("Program logic error: Input should have been given with the --in-place flag.");
+        let out_file =
+            out_file.expect("Program logic error: Output file should have already been specified.");
+        fs::rename(&out_file, &in_file)
+            .context(format!(
+                "Unable to overwrite the original file with the temporary formatted file. \nTmp file: {:?} -X-> input file: {:?}",
+                out_file,
+                in_file)
+            )?
     }
 
     Ok(())
