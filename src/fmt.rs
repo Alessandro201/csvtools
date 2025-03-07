@@ -66,7 +66,7 @@ impl FmtArgs {
             bail!("You cannot pass both --output and --in-place");
         }
         if self.in_place && self.input.is_none() {
-            bail!("You cannot pass --in-place flag if the input is not a file");
+            bail!("You cannot pass --in-place flag without giving a file to format");
         }
         Ok(())
     }
@@ -92,8 +92,8 @@ pub fn strip(fmt_args: &FmtArgs) -> Result<()> {
     let quote_char: u8 = fmt_args.quote_char as u8;
 
     let in_stream: Box<dyn io::Read> = if let Some(in_path) = fmt_args.input.clone() {
-        let file_handle = File::open(&in_path)
-            .with_context(|| format!("Error in opening input file {:?}", in_path))?;
+        let file_handle =
+            File::open(&in_path).context(format!("Error in opening input file {:?}", in_path))?;
         Box::new(file_handle)
     } else {
         Box::new(io::stdin())
@@ -116,7 +116,7 @@ pub fn strip(fmt_args: &FmtArgs) -> Result<()> {
             .create(true)
             .truncate(true)
             .open(file_path)
-            .with_context(|| format!("Error in opening output file {:?}", file_path))?;
+            .context(format!("Error in opening output file {:?}", file_path))?;
         Box::new(file_handle)
     } else {
         Box::new(io::stdout().lock())
@@ -340,8 +340,10 @@ pub fn format_file<P: AsRef<Path>, W: io::Write>(
         delimiter = DEFAULT_DELIMITER as u8;
     }
 
-    let file_handle = File::open(&file_path)
-        .with_context(|| format!("Error in opening input file {:?}", file_path.as_ref()))?;
+    let file_handle = File::open(&file_path).context(format!(
+        "Error in opening input file {:?}",
+        file_path.as_ref()
+    ))?;
 
     let mmap = unsafe {
         Mmap::map(&file_handle)
@@ -418,6 +420,7 @@ pub fn format_file<P: AsRef<Path>, W: io::Write>(
         pad_and_write_unchecked(&mut wrt, &mut rdr, comment_char, cols_width)?;
         wrt.flush()?;
     }
+
     Ok(())
 }
 
