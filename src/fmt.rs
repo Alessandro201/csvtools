@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use clap::{ArgAction, Args};
-use csv::{self, ByteRecord, QuoteStyle};
+use csv::{self, ByteRecord, QuoteStyle, StringRecord};
 use lazy_static::lazy_static;
 use log::debug;
 use memmap::Mmap;
@@ -72,7 +72,7 @@ impl FmtArgs {
     }
 }
 
-#[inline]
+#[inline(always)]
 fn parse_char(s: &str) -> Result<char, &'static str> {
     match s {
         "\\t" => Ok('\t'),
@@ -82,8 +82,13 @@ fn parse_char(s: &str) -> Result<char, &'static str> {
 }
 
 #[inline(always)]
-fn is_comment(record: &csv::ByteRecord, comment_char: u8) -> bool {
-    record.get(0).unwrap_or(b"").first() == Some(&comment_char)
+fn is_comment(record: &csv::StringRecord, comment_char: char) -> bool {
+    record.get(0).unwrap_or("").starts_with(comment_char)
+}
+
+#[inline(always)]
+fn is_comment_byte(record: &csv::ByteRecord, comment_char: u8) -> bool {
+    record.get(0).unwrap_or(b"").starts_with(&[comment_char])
 }
 
 pub fn strip(fmt_args: &FmtArgs) -> Result<()> {
@@ -134,7 +139,7 @@ pub fn strip(fmt_args: &FmtArgs) -> Result<()> {
 
     let mut raw_record: ByteRecord = ByteRecord::new();
     while rdr.read_byte_record(&mut raw_record)? {
-        if is_comment(&raw_record, comment_char) {
+        if is_comment_byte(&raw_record, comment_char) {
             wrt.write_byte_record(&raw_record)?;
             continue;
         }
@@ -153,6 +158,170 @@ pub fn strip(fmt_args: &FmtArgs) -> Result<()> {
 pub fn pad_and_write_unchecked<W, R>(
     wrt: &mut csv::Writer<W>,
     rdr: &mut csv::Reader<R>,
+    comment_char: char,
+    cols_width: Vec<usize>,
+) -> Result<Vec<usize>>
+where
+    W: io::Write,
+    R: io::Read,
+{
+    let tmp_spaces = " ".repeat(*cols_width.iter().max().unwrap_or(&1));
+    let mut tmp_field = String::with_capacity(cols_width.iter().sum());
+    let mut tmp_record = StringRecord::with_capacity(cols_width.iter().sum(), cols_width.len());
+    let mut record = StringRecord::new();
+
+    while rdr.read_record(&mut record)? {
+        if is_comment(&record, comment_char) {
+            wrt.write_record(&record)?;
+            continue;
+        }
+        // Skip empty lines or filled with only spaces
+        if record.len() <= 1 && record.get(0).unwrap_or("").trim().is_empty() {
+            continue;
+        }
+
+        tmp_record.clear();
+        for (col, field) in record.iter().map(|field| field.trim_end()).enumerate() {
+            assert!(record.len() <= cols_width.len());
+            let field_width = field.chars().count();
+            debug_assert!(field_width < cols_width[col]);
+
+            tmp_field.clear();
+            tmp_field.push_str(field);
+            if col != record.len() - 1 {
+                tmp_field.push_str(&tmp_spaces[0..(cols_width[col] - field_width)]);
+            }
+            tmp_record.push_field(&tmp_field);
+        }
+        wrt.write_record(&tmp_record)?
+    }
+
+    Ok(cols_width)
+}
+
+pub fn pad_and_write_unbuffered<W, R>(
+    wrt: &mut csv::Writer<W>,
+    rdr: &mut csv::Reader<R>,
+    comment_char: char,
+    mut cols_width: Vec<usize>,
+) -> Result<Vec<usize>>
+where
+    W: io::Write,
+    R: io::Read,
+{
+    let mut tmp_spaces = " ".repeat(*cols_width.iter().max().unwrap_or(&1));
+    let mut tmp_field = String::with_capacity(cols_width.iter().sum());
+    let mut tmp_record = StringRecord::with_capacity(cols_width.iter().sum(), cols_width.len());
+    let mut record = StringRecord::new();
+
+    while rdr.read_record(&mut record)? {
+        if is_comment(&record, comment_char) {
+            wrt.write_record(&record)?;
+            continue;
+        }
+
+        // Skip empty lines or filled with only spaces
+        if record.len() <= 1 && record.get(0).unwrap_or("").trim().is_empty() {
+            continue;
+        }
+
+        if record.len() > cols_width.len() {
+            cols_width.resize(record.len(), 0);
+        }
+
+        tmp_record.clear();
+        for (col, field) in record.iter().map(|field| field.trim_end()).enumerate() {
+            // Trimmed and added 1 for the the space at the end
+            let field_width = field.chars().count();
+            if cols_width[col] < field_width + 1 {
+                cols_width[col] = field_width + 1;
+                tmp_spaces = " ".repeat(tmp_spaces.len().max(field_width));
+            }
+            tmp_field.clear();
+            tmp_field.push_str(field);
+            // if the field is the last, just add a space at the end
+            if col != record.len() - 1 {
+                tmp_field.push_str(&tmp_spaces[0..(cols_width[col] - field_width)]);
+            }
+            tmp_record.push_field(&tmp_field);
+        }
+        wrt.write_record(&tmp_record)?;
+    }
+
+    Ok(cols_width)
+}
+
+pub fn pad_and_write_buffered<W>(
+    wrt: &mut csv::Writer<W>,
+    buffer: &[StringRecord],
+    comment_char: char,
+) -> Result<Vec<usize>>
+where
+    W: io::Write,
+{
+    let mut cols_width: Vec<usize> = vec![0; 1000];
+
+    for record in buffer.iter() {
+        if is_comment(record, comment_char) {
+            continue;
+        }
+
+        if cols_width.len() < record.len() {
+            cols_width.resize(record.len(), 0);
+        }
+
+        // Each field is trimmed and added 1 for the the space at the end
+        for (col, field_width) in record
+            .iter()
+            .map(|field| field.trim_end().chars().count() + 1)
+            .enumerate()
+        {
+            if cols_width[col] < field_width {
+                cols_width[col] = field_width
+            }
+        }
+    }
+
+    let tmp_spaces = " ".repeat(*cols_width.iter().max().unwrap_or(&1));
+    let mut tmp_field = String::with_capacity(cols_width.iter().sum());
+    let mut tmp_record = StringRecord::with_capacity(cols_width.iter().sum(), cols_width.len());
+    for record in buffer.iter() {
+        if is_comment(record, comment_char) {
+            wrt.write_record(record)?;
+            continue;
+        }
+
+        // Skip empty lines or filled with only spaces
+        if record.len() <= 1 && record.get(0).unwrap_or("").trim().is_empty() {
+            continue;
+        }
+
+        // for (col, value) in record.iter().enumerate() {
+        //     tmp_field.clear();
+        //     tmp_field.extend_from_slice(value);
+        //     tmp_field.extend_from_slice(&tmp_spaces[0..(cols_width[col] - value.len())]);
+        //     wrt.write_field(&tmp_field)?
+        // }
+        // wrt.write_record(None::<&[u8]>)?;
+
+        tmp_record.clear();
+        for (col, field) in record.iter().map(|field| field.trim_end()).enumerate() {
+            tmp_field.clear();
+            tmp_field.push_str(field);
+            // if the field is the last, just add a space at the end
+            if col != record.len() - 1 {
+                tmp_field.push_str(&tmp_spaces[0..(cols_width[col] - field.chars().count())]);
+            }
+            tmp_record.push_field(&tmp_field);
+        }
+        wrt.write_record(&tmp_record)?;
+    }
+    Ok(cols_width)
+}
+
+pub fn pad_and_write_unchecked_byte<W, R>(
+    wrt: &mut csv::Writer<W>,
+    rdr: &mut csv::Reader<R>,
     comment_char: u8,
     cols_width: Vec<usize>,
 ) -> Result<Vec<usize>>
@@ -166,12 +335,12 @@ where
     let mut raw_record = ByteRecord::new();
 
     while rdr.read_byte_record(&mut raw_record)? {
-        if is_comment(&raw_record, comment_char) {
+        if is_comment_byte(&raw_record, comment_char) {
             wrt.write_byte_record(&raw_record)?;
             continue;
         }
         // Skip empty lines or filled with only spaces
-        if raw_record.len() <= 1 && raw_record.get(1).unwrap_or(b"").trim_ascii().is_empty() {
+        if raw_record.len() <= 1 && raw_record.get(0).unwrap_or(b"").trim_ascii().is_empty() {
             continue;
         }
 
@@ -195,7 +364,7 @@ where
     Ok(cols_width)
 }
 
-pub fn pad_and_write_unbuffered<W, R>(
+pub fn pad_and_write_unbuffered_byte<W, R>(
     wrt: &mut csv::Writer<W>,
     rdr: &mut csv::Reader<R>,
     comment_char: u8,
@@ -211,13 +380,13 @@ where
     let mut raw_record = ByteRecord::new();
 
     while rdr.read_byte_record(&mut raw_record)? {
-        if is_comment(&raw_record, comment_char) {
+        if is_comment_byte(&raw_record, comment_char) {
             wrt.write_byte_record(&raw_record)?;
             continue;
         }
 
         // Skip empty lines or filled with only spaces
-        if raw_record.len() <= 1 && raw_record.get(1).unwrap_or(b"").trim_ascii().is_empty() {
+        if raw_record.len() <= 1 && raw_record.get(0).unwrap_or(b"").trim_ascii().is_empty() {
             continue;
         }
 
@@ -251,7 +420,7 @@ where
     Ok(cols_width)
 }
 
-pub fn pad_and_write_buffered<W>(
+pub fn pad_and_write_buffered_byte<W>(
     wrt: &mut csv::Writer<W>,
     buffer: &[ByteRecord],
     comment_char: u8,
@@ -262,7 +431,7 @@ where
     let mut cols_width: Vec<usize> = vec![0; 1000];
 
     for record in buffer.iter() {
-        if is_comment(record, comment_char) {
+        if is_comment_byte(record, comment_char) {
             continue;
         }
 
@@ -286,13 +455,13 @@ where
     let mut tmp_field = Vec::with_capacity(cols_width.iter().sum());
     let mut tmp_byte_record = ByteRecord::with_capacity(cols_width.iter().sum(), cols_width.len());
     for record in buffer.iter() {
-        if is_comment(record, comment_char) {
+        if is_comment_byte(record, comment_char) {
             wrt.write_byte_record(record)?;
             continue;
         }
 
         // Skip empty lines or filled with only spaces
-        if record.len() <= 1 && record.get(1).unwrap_or(b"").trim_ascii().is_empty() {
+        if record.len() <= 1 && record.get(0).unwrap_or(b"").trim_ascii().is_empty() {
             continue;
         }
 
@@ -328,14 +497,14 @@ pub fn format_file<P: AsRef<Path>, W: io::Write>(
     file_path: P,
     out_stream: &mut W,
 ) -> Result<()> {
-    let comment_char: u8 = fmt_args.comment_char as u8;
-    let quote_char: u8 = fmt_args.quote_char as u8;
+    let comment_char = fmt_args.comment_char;
+    let quote_char = fmt_args.quote_char;
     let delimiter: u8;
 
     if fmt_args.delimiter.is_some() {
         delimiter = fmt_args.delimiter.unwrap() as u8;
     } else if file_path.as_ref().extension().is_some_and(|e| e == "csv") {
-        delimiter = ',' as u8;
+        delimiter = b',';
     } else {
         delimiter = DEFAULT_DELIMITER as u8;
     }
@@ -354,7 +523,7 @@ pub fn format_file<P: AsRef<Path>, W: io::Write>(
         .delimiter(delimiter)
         .has_headers(false)
         .flexible(true)
-        .quote(quote_char)
+        .quote(quote_char as u8)
         .double_quote(true)
         .comment(None)
         // .terminator(Terminator::CRLF)
@@ -364,61 +533,114 @@ pub fn format_file<P: AsRef<Path>, W: io::Write>(
         .delimiter(delimiter)
         .has_headers(false)
         .flexible(true)
-        .quote(quote_char)
+        .quote(quote_char as u8)
         .quote_style(QuoteStyle::Necessary)
         .double_quote(true)
         // .terminator(Terminator::CRLF)
         .from_writer(out_stream);
 
-    let mut raw_record = ByteRecord::new();
-    if let Some(buffer_lines) = fmt_args.buffer_fmt {
-        // Buffer first x lines and check the column width on all of them,
-        // then switch to write a line as soon as it's read, without keeping it in memory.
-        // The column widths are increased if necessary when a longer field is found, but the
-        // process doe not wait for all the file to be read.
-        let mut buffer: Vec<ByteRecord> = Vec::with_capacity(buffer_lines);
-        let mut line_count = 0;
+    if fmt_args.utf8 {
+        let mut raw_record = StringRecord::new();
+        if let Some(buffer_lines) = fmt_args.buffer_fmt {
+            // Buffer first x lines and check the column width on all of them,
+            // then switch to write a line as soon as it's read, without keeping it in memory.
+            // The column widths are increased if necessary when a longer field is found, but the
+            // process doe not wait for all the file to be read.
+            let mut buffer: Vec<StringRecord> = Vec::with_capacity(buffer_lines);
+            let mut line_count = 0;
 
-        while line_count < buffer_lines && rdr.read_byte_record(&mut raw_record)? {
-            buffer.push(raw_record.clone());
-            line_count += 1;
-        }
-
-        let cols_width = pad_and_write_buffered(&mut wrt, &buffer, comment_char)?;
-        wrt.flush()?;
-
-        pad_and_write_unbuffered(&mut wrt, &mut rdr, comment_char, cols_width)?;
-        wrt.flush()?;
-        return Ok(());
-    } else {
-        // This way instead read the whole file in two-passes.
-        // The first computes the column width and the second formats the lines and writes them
-        let mut cols_width = vec![0; 1000];
-        let start_pos = rdr.position().clone();
-        while rdr.read_byte_record(&mut raw_record)? {
-            if is_comment(&raw_record, comment_char) {
-                continue;
+            while line_count < buffer_lines && rdr.read_record(&mut raw_record)? {
+                buffer.push(raw_record.clone());
+                line_count += 1;
             }
 
-            if cols_width.len() < raw_record.len() {
-                cols_width.resize(raw_record.len(), 0);
-            }
+            let cols_width = pad_and_write_buffered(&mut wrt, &buffer, comment_char)?;
+            wrt.flush()?;
 
-            // Trimmed and added 1 for the the space at the end
-            for (col, field_width) in raw_record
-                .iter()
-                .map(|field| field.trim_ascii_end().len() + 1)
-                .enumerate()
-            {
-                if cols_width[col] < field_width {
-                    cols_width[col] = field_width
+            pad_and_write_unbuffered(&mut wrt, &mut rdr, comment_char, cols_width)?;
+            wrt.flush()?;
+            return Ok(());
+        } else {
+            // This way instead read the whole file in two-passes.
+            // The first computes the column width and the second formats the lines and writes them
+            let mut cols_width = vec![0; 1000];
+            let start_pos = rdr.position().clone();
+            while rdr.read_record(&mut raw_record)? {
+                if is_comment(&raw_record, comment_char) {
+                    continue;
+                }
+
+                if cols_width.len() < raw_record.len() {
+                    cols_width.resize(raw_record.len(), 0);
+                }
+
+                // Trimmed and added 1 for the the space at the end
+                for (col, field_width) in raw_record
+                    .iter()
+                    .map(|field| field.trim_end().len() + 1)
+                    .enumerate()
+                {
+                    if cols_width[col] < field_width {
+                        cols_width[col] = field_width
+                    }
                 }
             }
-        }
 
-        rdr.seek(start_pos)?;
-        pad_and_write_unchecked(&mut wrt, &mut rdr, comment_char, cols_width)?;
-        wrt.flush()?;
+            rdr.seek(start_pos)?;
+            pad_and_write_unchecked(&mut wrt, &mut rdr, comment_char, cols_width)?;
+            wrt.flush()?;
+        }
+    } else {
+        let mut raw_record = ByteRecord::new();
+        if let Some(buffer_lines) = fmt_args.buffer_fmt {
+            // Buffer first x lines and check the column width on all of them,
+            // then switch to write a line as soon as it's read, without keeping it in memory.
+            // The column widths are increased if necessary when a longer field is found, but the
+            // process doe not wait for all the file to be read.
+            let mut buffer: Vec<ByteRecord> = Vec::with_capacity(buffer_lines);
+            let mut line_count = 0;
+
+            while line_count < buffer_lines && rdr.read_byte_record(&mut raw_record)? {
+                buffer.push(raw_record.clone());
+                line_count += 1;
+            }
+
+            let cols_width = pad_and_write_buffered_byte(&mut wrt, &buffer, comment_char as u8)?;
+            wrt.flush()?;
+
+            pad_and_write_unbuffered_byte(&mut wrt, &mut rdr, comment_char as u8, cols_width)?;
+            wrt.flush()?;
+            return Ok(());
+        } else {
+            // This way instead read the whole file in two-passes.
+            // The first computes the column width and the second formats the lines and writes them
+            let mut cols_width = vec![0; 1000];
+            let start_pos = rdr.position().clone();
+            while rdr.read_byte_record(&mut raw_record)? {
+                if is_comment_byte(&raw_record, comment_char as u8) {
+                    continue;
+                }
+
+                if cols_width.len() < raw_record.len() {
+                    cols_width.resize(raw_record.len(), 0);
+                }
+
+                // Trimmed and added 1 for the the space at the end
+                for (col, field_width) in raw_record
+                    .iter()
+                    .map(|field| field.trim_ascii_end().len() + 1)
+                    .enumerate()
+                {
+                    if cols_width[col] < field_width {
+                        cols_width[col] = field_width
+                    }
+                }
+            }
+
+            rdr.seek(start_pos)?;
+            pad_and_write_unchecked_byte(&mut wrt, &mut rdr, comment_char as u8, cols_width)?;
+            wrt.flush()?;
+        }
     }
 
     Ok(())
@@ -429,15 +651,15 @@ pub fn format<R: io::Read, W: io::Write>(
     in_stream: &mut R,
     out_stream: &mut W,
 ) -> Result<()> {
-    let comment_char: u8 = fmt_args.comment_char as u8;
-    let quote_char: u8 = fmt_args.quote_char as u8;
+    let comment_char = fmt_args.comment_char;
+    let quote_char = fmt_args.quote_char;
     let delimiter: u8 = fmt_args.delimiter.unwrap_or(DEFAULT_DELIMITER) as u8;
 
     let mut rdr = csv::ReaderBuilder::new()
         .delimiter(delimiter)
         .has_headers(false)
         .flexible(true)
-        .quote(quote_char)
+        .quote(quote_char as u8)
         .double_quote(true)
         .comment(None)
         // .terminator(Terminator::CRLF)
@@ -447,35 +669,60 @@ pub fn format<R: io::Read, W: io::Write>(
         .delimiter(delimiter)
         .has_headers(false)
         .flexible(true)
-        .quote(quote_char)
+        .quote(quote_char as u8)
         .quote_style(QuoteStyle::Necessary)
         .double_quote(true)
         // .terminator(Terminator::CRLF)
         .from_writer(out_stream);
 
-    let mut buffer: Vec<ByteRecord> = Vec::with_capacity(DEFAULT_BUFFER_LINES);
-
-    if let Some(buffer_lines) = fmt_args.buffer_fmt {
-        for (line_count, record) in rdr.byte_records().enumerate() {
-            if line_count > buffer_lines {
-                break;
+    if fmt_args.utf8 {
+        let mut buffer: Vec<StringRecord> = Vec::with_capacity(DEFAULT_BUFFER_LINES);
+        if let Some(buffer_lines) = fmt_args.buffer_fmt {
+            for (line_count, record) in rdr.records().enumerate() {
+                if line_count > buffer_lines {
+                    break;
+                }
+                buffer.push(record?);
             }
-            buffer.push(record?);
+
+            let cols_width = pad_and_write_buffered(&mut wrt, &buffer, comment_char)?;
+            wrt.flush()?;
+
+            pad_and_write_unbuffered(&mut wrt, &mut rdr, comment_char, cols_width)?;
+            wrt.flush()?;
+        } else {
+            // TODO: Add saving the buffer to a file in case it exceed the memory available
+            for record in rdr.records() {
+                let record = record?;
+                buffer.push(record);
+            }
+            pad_and_write_buffered(&mut wrt, &buffer, comment_char)?;
+            wrt.flush()?;
         }
-
-        let cols_width = pad_and_write_buffered(&mut wrt, &buffer, comment_char)?;
-        wrt.flush()?;
-
-        pad_and_write_unbuffered(&mut wrt, &mut rdr, comment_char, cols_width)?;
-        wrt.flush()?;
     } else {
-        // TODO: Add saving the buffer to a file in case it exceed the memory available
-        for record in rdr.byte_records() {
-            let record = record?;
-            buffer.push(record);
+        let mut buffer: Vec<ByteRecord> = Vec::with_capacity(DEFAULT_BUFFER_LINES);
+        if let Some(buffer_lines) = fmt_args.buffer_fmt {
+            for (line_count, record) in rdr.byte_records().enumerate() {
+                if line_count > buffer_lines {
+                    break;
+                }
+                buffer.push(record?);
+            }
+
+            let cols_width = pad_and_write_buffered_byte(&mut wrt, &buffer, comment_char as u8)?;
+            wrt.flush()?;
+
+            pad_and_write_unbuffered_byte(&mut wrt, &mut rdr, comment_char as u8, cols_width)?;
+            wrt.flush()?;
+        } else {
+            // TODO: Add saving the buffer to a file in case it exceed the memory available
+            for record in rdr.byte_records() {
+                let record = record?;
+                buffer.push(record);
+            }
+            pad_and_write_buffered_byte(&mut wrt, &buffer, comment_char as u8)?;
+            wrt.flush()?;
         }
-        pad_and_write_buffered(&mut wrt, &buffer, comment_char)?;
-        wrt.flush()?;
     }
 
     Ok(())
@@ -508,7 +755,7 @@ fn get_output_dest(fmt_args: &FmtArgs) -> Option<PathBuf> {
         None
     };
 
-    return output_file;
+    output_file
 }
 
 /// If an output file is given open it, otherwise acquire a lock to stdout
@@ -544,8 +791,8 @@ pub fn run(fmt_args: FmtArgs) -> anyhow::Result<()> {
 
     let result = if fmt_args.strip {
         strip(&fmt_args)
-    } else if let Some(file_path) = &fmt_args.input {
-        format_file(&fmt_args, file_path, &mut out_stream)
+    } else if let Some(in_file) = &fmt_args.input {
+        format_file(&fmt_args, in_file, &mut out_stream)
     } else {
         let mut in_stream = io::stdin();
         format(&fmt_args, &mut in_stream, &mut out_stream)
@@ -569,7 +816,7 @@ pub fn run(fmt_args: FmtArgs) -> anyhow::Result<()> {
             .expect("Program logic error: Input should have been given with the --in-place flag.");
         let out_file =
             out_file.expect("Program logic error: Output file should have already been specified.");
-        fs::rename(&out_file, &in_file)
+        fs::rename(&out_file, in_file)
             .context(format!(
                 "Unable to overwrite the original file with the temporary formatted file. \nTmp file: {:?} -X-> input file: {:?}",
                 out_file,
@@ -596,6 +843,7 @@ mod tests {
             delimiter: Some(','),
             comment_char: '#',
             quote_char: '"',
+            utf8: false,
             buffer_fmt: None,
             output: None,
             input: None,
@@ -637,6 +885,7 @@ mod tests {
             delimiter: Some(','),
             comment_char: '#',
             quote_char: '"',
+            utf8: false,
             buffer_fmt: None,
             output: None,
             input: None,
@@ -672,6 +921,7 @@ mod tests {
             delimiter: Some(','),
             comment_char: '#',
             quote_char: '"',
+            utf8: false,
             buffer_fmt: None,
             output: None,
             input: None,
@@ -713,6 +963,7 @@ ciao2       ,gatto ,extra field
             delimiter: Some(','),
             comment_char: '#',
             quote_char: '"',
+            utf8: false,
             buffer_fmt: None,
             output: None,
             input: None,
@@ -755,6 +1006,7 @@ ciao2       ,   gatto
             delimiter: Some(','),
             comment_char: '#',
             quote_char: '"',
+            utf8: false,
             buffer_fmt: None,
             output: None,
             input: None,
@@ -793,6 +1045,7 @@ ciao2              ," ""  ,gatto,"
             delimiter: Some(','),
             comment_char: '#',
             quote_char: '"',
+            utf8: false,
             buffer_fmt: None,
             output: None,
             input: None,
