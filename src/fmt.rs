@@ -9,6 +9,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self},
     path::{Path, PathBuf},
+    process::exit,
 };
 
 const DEFAULT_DELIMITER: char = '\t';
@@ -758,6 +759,17 @@ fn get_output_dest(fmt_args: &FmtArgs) -> Option<PathBuf> {
     output_file
 }
 
+fn get_in_stream(in_file: Option<&PathBuf>) -> Result<Box<dyn io::Read>> {
+    let in_stream: Box<dyn io::Read> = if let Some(input_file) = in_file {
+        let file_handle = File::open(input_file)
+            .context(format!("Error in opening input file {:?}", input_file))?;
+        Box::new(file_handle)
+    } else {
+        Box::new(io::stdin().lock())
+    };
+    Ok(in_stream)
+}
+
 /// If an output file is given open it, otherwise acquire a lock to stdout
 fn get_out_stream(out_file: Option<&PathBuf>) -> Result<Box<dyn io::Write>> {
     let out_stream: Box<dyn io::Write> = if let Some(ref output_file) = out_file {
@@ -778,6 +790,8 @@ pub fn run(fmt_args: FmtArgs) -> anyhow::Result<()> {
     fmt_args.check_args()?;
     debug!("{:#?}", &fmt_args);
 
+    let in_file: Option<PathBuf> = fmt_args.input.clone();
+    let mut in_stream: Box<dyn io::Read> = get_in_stream(in_file.as_ref())?;
     let out_file: Option<PathBuf> = get_output_dest(&fmt_args);
     let mut out_stream: Box<dyn io::Write> = get_out_stream(out_file.as_ref())?;
 
@@ -789,24 +803,24 @@ pub fn run(fmt_args: FmtArgs) -> anyhow::Result<()> {
         assert!(out_file.is_some());
     }
 
-    let result = if fmt_args.strip {
-        strip(&fmt_args)
-    } else if let Some(in_file) = &fmt_args.input {
-        format_file(&fmt_args, in_file, &mut out_stream)
+    // Set CTRL+C signal handler. Removes temporary files if present and stop the process
+    if fmt_args.in_place {
+        let out_file_copy = out_file.clone().unwrap();
+        ctrlc::set_handler(move || {
+            fs::remove_file(&out_file_copy).expect("Unable to remove temporary file");
+            exit(2)
+        })
+        .expect("Error setting Ctrl-C handler");
     } else {
-        let mut in_stream = io::stdin();
-        format(&fmt_args, &mut in_stream, &mut out_stream)
-    };
+        ctrlc::set_handler(|| exit(2)).expect("Error setting Ctrl-C handler");
+    }
 
-    if let Err(err) = result {
-        if let Some(csv_err) = err.downcast_ref::<csv::Error>() {
-            match csv_err.kind() {
-                csv::ErrorKind::Io(err) if err.kind() == io::ErrorKind::BrokenPipe => return Ok(()),
-                _ => bail!(err),
-            }
-        } else {
-            bail!(err)
-        };
+    if fmt_args.strip {
+        strip(&fmt_args, &mut in_stream, &mut out_stream)?
+    } else if let Some(in_file) = in_file {
+        format_file(&fmt_args, in_file, &mut out_stream)?
+    } else {
+        format(&fmt_args, &mut in_stream, &mut out_stream)?
     };
 
     // In case the --in-place flag was given overwrite the original file with the temporary one
