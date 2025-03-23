@@ -71,6 +71,20 @@ impl FmtArgs {
         }
         Ok(())
     }
+
+    fn set_delimiter(&self, delimiter: Option<char>) -> Self {
+        FmtArgs {
+            delimiter,
+            strip: self.strip,
+            comment_char: self.comment_char,
+            quote_char: self.quote_char,
+            buffer_fmt: self.buffer_fmt,
+            in_place: self.in_place,
+            utf8: self.utf8,
+            output: self.output.clone(),
+            input: self.input.clone(),
+        }
+    }
 }
 
 #[inline(always)]
@@ -92,18 +106,30 @@ fn is_comment_byte(record: &csv::ByteRecord, comment_char: u8) -> bool {
     record.get(0).unwrap_or(b"").starts_with(&[comment_char])
 }
 
-pub fn strip(fmt_args: &FmtArgs) -> Result<()> {
-    let comment_char: u8 = fmt_args.comment_char as u8;
-    let delimiter: u8 = fmt_args.delimiter.unwrap_or(DEFAULT_DELIMITER) as u8;
-    let quote_char: u8 = fmt_args.quote_char as u8;
-
-    let in_stream: Box<dyn io::Read> = if let Some(in_path) = fmt_args.input.clone() {
-        let file_handle =
-            File::open(&in_path).context(format!("Error in opening input file {:?}", in_path))?;
-        Box::new(file_handle)
+// Get the delimiter either from the FmtArgs, from the file extension or the default
+// DEFAULT_LIMITER
+fn get_delimiter(fmt_args: &FmtArgs) -> char {
+    if let Some(delimiter) = fmt_args.delimiter {
+        delimiter
+    } else if fmt_args
+        .input
+        .as_ref()
+        .is_some_and(|path| path.extension().is_some_and(|ext| ext == "csv"))
+    {
+        ','
     } else {
-        Box::new(io::stdin())
-    };
+        DEFAULT_DELIMITER
+    }
+}
+
+pub fn strip<R: io::Read, W: io::Write>(
+    fmt_args: &FmtArgs,
+    in_stream: &mut R,
+    out_stream: &mut W,
+) -> Result<()> {
+    let delimiter: u8 = fmt_args.delimiter.unwrap_or(DEFAULT_DELIMITER) as u8;
+    let comment_char = fmt_args.comment_char;
+    let quote_char: u8 = fmt_args.quote_char as u8;
 
     // Build the CSV reader and iterate over each record.
     let mut rdr = csv::ReaderBuilder::new()
@@ -116,18 +142,6 @@ pub fn strip(fmt_args: &FmtArgs) -> Result<()> {
         // .terminator(Terminator::CRLF)
         .from_reader(in_stream);
 
-    let out_stream: Box<dyn io::Write> = if let Some(file_path) = &fmt_args.output {
-        let file_handle = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(file_path)
-            .context(format!("Error in opening output file {:?}", file_path))?;
-        Box::new(file_handle)
-    } else {
-        Box::new(io::stdout().lock())
-    };
-
     let mut wrt = csv::WriterBuilder::new()
         .delimiter(delimiter)
         .has_headers(false)
@@ -138,18 +152,34 @@ pub fn strip(fmt_args: &FmtArgs) -> Result<()> {
         // .terminator(Terminator::CRLF)
         .from_writer(out_stream);
 
-    let mut raw_record: ByteRecord = ByteRecord::new();
-    while rdr.read_byte_record(&mut raw_record)? {
-        if is_comment_byte(&raw_record, comment_char) {
-            wrt.write_byte_record(&raw_record)?;
-            continue;
-        }
+    if fmt_args.utf8 {
+        let mut raw_record: StringRecord = StringRecord::new();
+        while rdr.read_record(&mut raw_record)? {
+            if is_comment(&raw_record, comment_char) {
+                wrt.write_record(&raw_record)?;
+                continue;
+            }
 
-        for field in raw_record.iter() {
-            wrt.write_field(field.trim_ascii())?
-        }
+            for field in raw_record.iter() {
+                wrt.write_field(field.trim())?
+            }
 
-        wrt.write_record(None::<&[u8]>)?
+            wrt.write_record(None::<&[u8]>)?
+        }
+    } else {
+        let mut raw_record: ByteRecord = ByteRecord::new();
+        while rdr.read_byte_record(&mut raw_record)? {
+            if is_comment_byte(&raw_record, comment_char as u8) {
+                wrt.write_byte_record(&raw_record)?;
+                continue;
+            }
+
+            for field in raw_record.iter() {
+                wrt.write_field(field.trim_ascii())?
+            }
+
+            wrt.write_record(None::<&[u8]>)?
+        }
     }
     wrt.flush()?;
 
@@ -498,17 +528,9 @@ pub fn format_file<P: AsRef<Path>, W: io::Write>(
     file_path: P,
     out_stream: &mut W,
 ) -> Result<()> {
-    let comment_char = fmt_args.comment_char;
-    let quote_char = fmt_args.quote_char;
-    let delimiter: u8;
-
-    if fmt_args.delimiter.is_some() {
-        delimiter = fmt_args.delimiter.unwrap() as u8;
-    } else if file_path.as_ref().extension().is_some_and(|e| e == "csv") {
-        delimiter = b',';
-    } else {
-        delimiter = DEFAULT_DELIMITER as u8;
-    }
+    let comment_char = fmt_args.comment_char as u8;
+    let quote_char = fmt_args.quote_char as u8;
+    let delimiter = fmt_args.delimiter.unwrap_or(DEFAULT_DELIMITER) as u8;
 
     let file_handle = File::open(&file_path).context(format!(
         "Error in opening input file {:?}",
@@ -516,15 +538,17 @@ pub fn format_file<P: AsRef<Path>, W: io::Write>(
     ))?;
 
     let mmap = unsafe {
-        Mmap::map(&file_handle)
-            .unwrap_or_else(|_| panic!("Error mapping file {}", file_path.as_ref().display()))
+        Mmap::map(&file_handle).context(format!(
+            "Error memory mapping file {}",
+            file_path.as_ref().display()
+        ))?
     };
     let mmap_reader = io::Cursor::new(mmap);
     let mut rdr = csv::ReaderBuilder::new()
         .delimiter(delimiter)
         .has_headers(false)
         .flexible(true)
-        .quote(quote_char as u8)
+        .quote(quote_char)
         .double_quote(true)
         .comment(None)
         // .terminator(Terminator::CRLF)
@@ -534,7 +558,7 @@ pub fn format_file<P: AsRef<Path>, W: io::Write>(
         .delimiter(delimiter)
         .has_headers(false)
         .flexible(true)
-        .quote(quote_char as u8)
+        .quote(quote_char)
         .quote_style(QuoteStyle::Necessary)
         .double_quote(true)
         // .terminator(Terminator::CRLF)
@@ -555,10 +579,10 @@ pub fn format_file<P: AsRef<Path>, W: io::Write>(
                 line_count += 1;
             }
 
-            let cols_width = pad_and_write_buffered(&mut wrt, &buffer, comment_char)?;
+            let cols_width = pad_and_write_buffered(&mut wrt, &buffer, comment_char as char)?;
             wrt.flush()?;
 
-            pad_and_write_unbuffered(&mut wrt, &mut rdr, comment_char, cols_width)?;
+            pad_and_write_unbuffered(&mut wrt, &mut rdr, comment_char as char, cols_width)?;
             wrt.flush()?;
             return Ok(());
         } else {
@@ -567,7 +591,7 @@ pub fn format_file<P: AsRef<Path>, W: io::Write>(
             let mut cols_width = vec![0; 1000];
             let start_pos = rdr.position().clone();
             while rdr.read_record(&mut raw_record)? {
-                if is_comment(&raw_record, comment_char) {
+                if is_comment(&raw_record, comment_char as char) {
                     continue;
                 }
 
@@ -588,7 +612,7 @@ pub fn format_file<P: AsRef<Path>, W: io::Write>(
             }
 
             rdr.seek(start_pos)?;
-            pad_and_write_unchecked(&mut wrt, &mut rdr, comment_char, cols_width)?;
+            pad_and_write_unchecked(&mut wrt, &mut rdr, comment_char as char, cols_width)?;
             wrt.flush()?;
         }
     } else {
@@ -606,10 +630,10 @@ pub fn format_file<P: AsRef<Path>, W: io::Write>(
                 line_count += 1;
             }
 
-            let cols_width = pad_and_write_buffered_byte(&mut wrt, &buffer, comment_char as u8)?;
+            let cols_width = pad_and_write_buffered_byte(&mut wrt, &buffer, comment_char)?;
             wrt.flush()?;
 
-            pad_and_write_unbuffered_byte(&mut wrt, &mut rdr, comment_char as u8, cols_width)?;
+            pad_and_write_unbuffered_byte(&mut wrt, &mut rdr, comment_char, cols_width)?;
             wrt.flush()?;
             return Ok(());
         } else {
@@ -618,7 +642,7 @@ pub fn format_file<P: AsRef<Path>, W: io::Write>(
             let mut cols_width = vec![0; 1000];
             let start_pos = rdr.position().clone();
             while rdr.read_byte_record(&mut raw_record)? {
-                if is_comment_byte(&raw_record, comment_char as u8) {
+                if is_comment_byte(&raw_record, comment_char) {
                     continue;
                 }
 
@@ -639,7 +663,7 @@ pub fn format_file<P: AsRef<Path>, W: io::Write>(
             }
 
             rdr.seek(start_pos)?;
-            pad_and_write_unchecked_byte(&mut wrt, &mut rdr, comment_char as u8, cols_width)?;
+            pad_and_write_unchecked_byte(&mut wrt, &mut rdr, comment_char, cols_width)?;
             wrt.flush()?;
         }
     }
@@ -795,7 +819,9 @@ pub fn run(fmt_args: FmtArgs) -> anyhow::Result<()> {
     let out_file: Option<PathBuf> = get_output_dest(&fmt_args);
     let mut out_stream: Box<dyn io::Write> = get_out_stream(out_file.as_ref())?;
 
+    let fmt_args = fmt_args.set_delimiter(Some(get_delimiter(&fmt_args)));
     if fmt_args.in_place {
+        // The arguments should have already been checked
         assert!(fmt_args.output.is_none());
         assert!(fmt_args.input.is_some());
 
