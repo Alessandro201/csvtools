@@ -18,35 +18,18 @@ struct Cli {
 
     /// Choose the operation you want to perform. The default is "fmt"
     #[command(subcommand)]
-    command: Option<Commands>,
+    command: Commands,
 }
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    // Format the file or STDIN by justifying all the columns. This is the default option which
-    // will be run when no subcommands is given
+    // Format the file or STDIN by justifying all the columns.
     #[command(name = "fmt")]
-    Fmt(fmt::FmtArgs),
-}
-
-fn help_and_exit() -> ! {
-    use clap::CommandFactory;
-    Cli::command().print_help().expect("Unable to write help");
-    std::process::exit(1)
+    Fmt(fmt::cli::FmtArgs),
 }
 
 fn main() -> Result<()> {
-    let mut env_args: Vec<String> = env::args().collect();
-    if env_args.len() < 2
-        || (env_args.len() == 2 && ["-h", "--help"].contains(&env_args[1].as_str()))
-    {
-        help_and_exit()
-    }
-    // No subcommand given, or the subommand is one of the known ones
-    if env_args[1].starts_with("-") || !["fmt", "help"].contains(&env_args[1].as_str()) {
-        env_args.insert(1, "fmt".to_string());
-    }
-    let args = Cli::parse_from(env_args);
+    let args = Cli::parse();
 
     if args.debug {
         TermLogger::init(
@@ -66,8 +49,8 @@ fn main() -> Result<()> {
 
     debug!("{:#?}", &args);
     match args.command {
-        Some(Commands::Fmt(fmt_args)) => fmt::run(fmt_args)?,
-        None => {}
+        Commands::Fmt(fmt_args) => fmt::run(fmt_args)?,
+        _ => {}
     }
 
     Ok(())
