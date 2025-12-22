@@ -2,17 +2,22 @@ use crate::fmt::cli::FmtArgs;
 use crate::fmt::DEFAULT_BUFFER_LINES;
 use crate::fmt::DEFAULT_DELIMITER;
 
-use anyhow::bail;
 use anyhow::{Context, Result};
 use csv::{self, ByteRecord, QuoteStyle, StringRecord, Terminator};
-use memmap::Mmap;
 use rand::{distributions::Alphanumeric, Rng};
+use simplelog::debug;
+use std::io::stdout;
+use std::io::BufReader;
+use std::io::IsTerminal;
 use std::{
     fs::{self, File, OpenOptions},
     io::{self},
     path::{Path, PathBuf},
     process::exit,
 };
+
+// WARN: Assumes that there will not be more than 10000 columns
+const MAX_COLUMNS: usize = 10000;
 
 #[derive(Debug)]
 struct CsvFormatter {
@@ -75,8 +80,15 @@ impl CsvFormatter {
         CsvFormatter { buffer, ..self }
     }
     pub fn from_args(fmt_args: &FmtArgs) -> Self {
+        let quote_style = match fmt_args.quote_style.as_str() {
+            "necessary" => QuoteStyle::Necessary,
+            "always" => QuoteStyle::Always,
+            "never" => QuoteStyle::Never,
+            "non-numeric" => QuoteStyle::NonNumeric,
+            _ => panic!("This --quote-style option is not available"),
+        };
         Self::default()
-            .set_delimiter(fmt_args.delimiter.unwrap_or(DEFAULT_DELIMITER))
+            .set_delimiter(get_delimiter(fmt_args))
             .set_comment_char({
                 if fmt_args.no_skip_comments {
                     None
@@ -85,13 +97,16 @@ impl CsvFormatter {
                 }
             })
             .set_flexible(fmt_args.flexible)
+            .set_quote_char(fmt_args.quote_char)
+            .set_quote_style(quote_style)
             .set_utf8(fmt_args.utf8)
+            .set_buffer(fmt_args.buffer_fmt)
             .set_quote_char(fmt_args.quote_char)
     }
 }
 
 impl CsvFormatter {
-    fn _set_csv_reader<'r, R: io::Read>(&self, in_stream: &'r mut R) -> csv::Reader<&'r mut R> {
+    fn _build_csv_reader<'r, R: io::Read>(&self, in_stream: &'r mut R) -> csv::Reader<&'r mut R> {
         csv::ReaderBuilder::new()
             .delimiter(self.delimiter as u8)
             .has_headers(false)
@@ -103,7 +118,7 @@ impl CsvFormatter {
             .from_reader(in_stream)
     }
 
-    fn _set_csv_writer<'w, W: io::Write>(&self, out_stream: &'w mut W) -> csv::Writer<&'w mut W> {
+    fn _build_csv_writer<'w, W: io::Write>(&self, out_stream: &'w mut W) -> csv::Writer<&'w mut W> {
         csv::WriterBuilder::new()
             .delimiter(self.delimiter as u8)
             .has_headers(false)
@@ -121,8 +136,8 @@ impl CsvFormatter {
         R: io::Read,
         W: io::Write,
     {
-        let rdr = self._set_csv_reader(in_stream);
-        let wrt = self._set_csv_writer(out_stream);
+        let rdr = self._build_csv_reader(in_stream);
+        let wrt = self._build_csv_writer(out_stream);
 
         if self.utf8 {
             self._format(rdr, wrt)?
@@ -173,7 +188,8 @@ impl CsvFormatter {
         let mut buffer: Vec<StringRecord> = Vec::with_capacity(DEFAULT_BUFFER_LINES);
         if let Some(buffer_lines) = self.buffer {
             for (line_n, record) in rdr.records().enumerate() {
-                if line_n > buffer_lines {
+                if line_n == buffer_lines {
+                    buffer.push(record?);
                     break;
                 }
                 buffer.push(record?);
@@ -202,8 +218,8 @@ impl CsvFormatter {
         R: io::Read,
         W: io::Write,
     {
-        let rdr = self._set_csv_reader(in_stream);
-        let wrt = self._set_csv_writer(out_stream);
+        let rdr = self._build_csv_reader(in_stream);
+        let wrt = self._build_csv_writer(out_stream);
 
         if self.utf8 {
             self._strip(rdr, wrt)?
@@ -263,7 +279,8 @@ impl CsvFormatter {
         P: AsRef<Path>,
         W: io::Write,
     {
-        Ok(())
+        let mut rdr = BufReader::new(fs::File::open(file)?);
+        self.format(&mut rdr, out_stream)
     }
 }
 
@@ -281,22 +298,32 @@ fn is_comment_byte(record: &csv::ByteRecord, comment_char: u8) -> bool {
 // DEFAULT_DELIMITER
 fn get_delimiter(fmt_args: &FmtArgs) -> char {
     if let Some(delimiter) = fmt_args.delimiter {
-        delimiter
-    } else if fmt_args
-        .input
-        .as_ref()
-        .is_some_and(|path| path.extension().is_some_and(|ext| ext == "csv"))
-    {
-        ','
-    } else if fmt_args
-        .input
-        .as_ref()
-        .is_some_and(|path| path.extension().is_some_and(|ext| ext == "tsv"))
-    {
-        '\t'
-    } else {
-        DEFAULT_DELIMITER
+        return delimiter;
     }
+
+    match fmt_args.input.as_ref().map(|path| path.extension()).flatten() {
+        Some(ext) if ext == "csv" => ',',
+        Some(ext) if ext == "tsv" => '\t',
+        Some(ext) if ext == "tab" => '\t',
+        _ => DEFAULT_DELIMITER,
+    }
+    // if let Some(delimiter) = fmt_args.delimiter {
+    //     delimiter
+    // } else if fmt_args
+    //     .input
+    //     .as_ref()
+    //     .is_some_and(|path| path.extension().is_some_and(|ext| ext == "csv"))
+    // {
+    //     ','
+    // } else if fmt_args
+    //     .input
+    //     .as_ref()
+    //     .is_some_and(|path| path.extension().is_some_and(|ext| ext == "tsv"))
+    // {
+    //     '\t'
+    // } else {
+    //     DEFAULT_DELIMITER
+    // }
 }
 
 pub fn pad_and_write_unchecked<W, R>(
@@ -321,6 +348,8 @@ where
         }
         // Skip empty lines or filled with only spaces
         if record.len() <= 1 && record.get(0).unwrap_or("").trim().is_empty() {
+            tmp_record.clear();
+            wrt.write_record(&tmp_record)?;
             continue;
         }
 
@@ -332,8 +361,10 @@ where
 
             tmp_field.clear();
             tmp_field.push_str(field);
-            if col != record.len() - 1 {
-                tmp_field.push_str(&tmp_spaces[0..(cols_width[col] - field_width)]);
+
+            // if the field is not the last, and the max_width is not 0 then add a space at the end
+            if col != record.len() - 1 && cols_width[col] != 0 {
+                tmp_field.push_str(&tmp_spaces[0..(cols_width[col] - field_width + 1)]);
             }
             tmp_record.push_field(&tmp_field);
         }
@@ -366,6 +397,8 @@ where
 
         // Skip empty lines or filled with only spaces
         if record.len() <= 1 && record.get(0).unwrap_or("").trim().is_empty() {
+            tmp_record.clear();
+            wrt.write_record(&tmp_record)?;
             continue;
         }
 
@@ -377,15 +410,16 @@ where
         for (col, field) in record.iter().map(|field| field.trim_end()).enumerate() {
             // Trimmed and added 1 for the the space at the end
             let field_width = field.chars().count();
-            if cols_width[col] < field_width + 1 {
-                cols_width[col] = field_width + 1;
+            if cols_width[col] < field_width {
+                cols_width[col] = field_width;
                 tmp_spaces = " ".repeat(tmp_spaces.len().max(field_width));
             }
             tmp_field.clear();
             tmp_field.push_str(field);
-            // if the field is the last, just add a space at the end
-            if col != record.len() - 1 {
-                tmp_field.push_str(&tmp_spaces[0..(cols_width[col] - field_width)]);
+
+            // if the field is not the last, and the max_width is not 0 then add a space at the end
+            if col != record.len() - 1 && cols_width[col] != 0 {
+                tmp_field.push_str(&tmp_spaces[0..(cols_width[col] - field_width + 1)]);
             }
             tmp_record.push_field(&tmp_field);
         }
@@ -403,7 +437,7 @@ pub fn pad_and_write_buffered<W>(
 where
     W: io::Write,
 {
-    let mut cols_width: Vec<usize> = vec![0; 1000];
+    let mut cols_width: Vec<usize> = vec![0; MAX_COLUMNS];
 
     for record in buffer.iter() {
         if comment_char.is_some_and(|c| is_comment(record, c)) {
@@ -414,12 +448,8 @@ where
             cols_width.resize(record.len(), 0);
         }
 
-        // Each field is trimmed and added 1 for the the space at the end
-        for (col, field_width) in record
-            .iter()
-            .map(|field| field.trim_end().chars().count() + 1)
-            .enumerate()
-        {
+        // Each field is trimmed
+        for (col, field_width) in record.iter().map(|field| field.trim_end().chars().count()).enumerate() {
             if cols_width[col] < field_width {
                 cols_width[col] = field_width
             }
@@ -437,6 +467,8 @@ where
 
         // Skip empty lines or filled with only spaces
         if record.len() <= 1 && record.get(0).unwrap_or("").trim().is_empty() {
+            tmp_record.clear();
+            wrt.write_record(&tmp_record)?;
             continue;
         }
 
@@ -452,9 +484,10 @@ where
         for (col, field) in record.iter().map(|field| field.trim_end()).enumerate() {
             tmp_field.clear();
             tmp_field.push_str(field);
-            // if the field is the last, just add a space at the end
-            if col != record.len() - 1 {
-                tmp_field.push_str(&tmp_spaces[0..(cols_width[col] - field.chars().count())]);
+
+            // if the field is not the last, and the max_width is not 0 then add a space at the end
+            if col != record.len() - 1 && cols_width[col] != 0 {
+                tmp_field.push_str(&tmp_spaces[0..(cols_width[col] - field.chars().count() + 1)]);
             }
             tmp_record.push_field(&tmp_field);
         }
@@ -485,6 +518,8 @@ where
         }
         // Skip empty lines or filled with only spaces
         if raw_record.len() <= 1 && raw_record.get(0).unwrap_or(b"").trim_ascii().is_empty() {
+            tmp_byte_record.clear();
+            wrt.write_record(&tmp_byte_record)?;
             continue;
         }
 
@@ -493,8 +528,10 @@ where
             debug_assert!(raw_record.len() <= cols_width.len());
             tmp_field.clear();
             tmp_field.extend_from_slice(field);
-            if col != raw_record.len() - 1 {
-                tmp_field.extend_from_slice(&tmp_spaces[0..(cols_width[col] - field.len())]);
+
+            // if the field is not the last, and the max_width is not 0 then add a space at the end
+            if col != raw_record.len() - 1 && cols_width[col] != 0 {
+                tmp_field.extend_from_slice(&tmp_spaces[0..(cols_width[col] - field.len() + 1)]);
             }
             tmp_byte_record.push_field(&tmp_field);
         }
@@ -527,6 +564,8 @@ where
 
         // Skip empty lines or filled with only spaces
         if raw_record.len() <= 1 && raw_record.get(0).unwrap_or(b"").trim_ascii().is_empty() {
+            tmp_byte_record.clear();
+            wrt.write_record(&tmp_byte_record)?;
             continue;
         }
 
@@ -538,15 +577,16 @@ where
         for (col, field) in raw_record.iter().map(|field| field.trim_ascii_end()).enumerate() {
             // Trimmed and added 1 for the the space at the end
             let field_width = field.len();
-            if cols_width[col] < field_width + 1 {
-                cols_width[col] = field_width + 1;
+            if cols_width[col] < field_width {
+                cols_width[col] = field_width;
                 tmp_spaces = [b' '].repeat(tmp_spaces.len().max(field_width));
             }
             tmp_field.clear();
             tmp_field.extend_from_slice(field);
-            // if the field is the last, just add a space at the end
-            if col != raw_record.len() - 1 {
-                tmp_field.extend_from_slice(&tmp_spaces[0..(cols_width[col] - field.len())]);
+
+            // if the field is not the last, and the max_width is not 0 then add a space at the end
+            if col != raw_record.len() - 1 && cols_width[col] != 0 {
+                tmp_field.extend_from_slice(&tmp_spaces[0..(cols_width[col] - field.len() + 1)]);
             }
             tmp_byte_record.push_field(&tmp_field);
         }
@@ -564,7 +604,7 @@ pub fn pad_and_write_buffered_byte<W>(
 where
     W: io::Write,
 {
-    let mut cols_width: Vec<usize> = vec![0; 1000];
+    let mut cols_width: Vec<usize> = vec![0; MAX_COLUMNS];
 
     for record in buffer.iter() {
         if comment_char.is_some_and(|c| is_comment_byte(record, c)) {
@@ -576,7 +616,7 @@ where
         }
 
         // Each field is trimmed and added 1 for the the space at the end
-        for (col, field_width) in record.iter().map(|field| field.trim_ascii_end().len() + 1).enumerate() {
+        for (col, field_width) in record.iter().map(|field| field.trim_ascii_end().len()).enumerate() {
             if cols_width[col] < field_width {
                 cols_width[col] = field_width
             }
@@ -594,6 +634,8 @@ where
 
         // Skip empty lines or filled with only spaces
         if record.len() <= 1 && record.get(0).unwrap_or(b"").trim_ascii().is_empty() {
+            tmp_byte_record.clear();
+            wrt.write_record(&tmp_byte_record)?;
             continue;
         }
 
@@ -609,6 +651,12 @@ where
         for (col, field) in record.iter().map(|field| field.trim_ascii_end()).enumerate() {
             tmp_field.clear();
             tmp_field.extend_from_slice(field);
+
+            // if the field is not the last, and the max_width is not 0 then add a space at the end
+            if col != record.len() - 1 && cols_width[col] != 0 {
+                tmp_field.extend_from_slice(&tmp_spaces[0..(cols_width[col] - field.len() + 1)]);
+            }
+
             // if the field is the last, just add a space at the end
             if col != record.len() - 1 {
                 tmp_field.extend_from_slice(&tmp_spaces[0..(cols_width[col] - field.len())]);
@@ -673,7 +721,7 @@ pub fn format_file<P: AsRef<Path>, W: io::Write>(fmt_args: &FmtArgs, file_path: 
         } else {
             // This way instead read the whole file in two-passes.
             // The first computes the column width and the second formats the lines and writes them
-            let mut cols_width = vec![0; 1000];
+            let mut cols_width = vec![0; MAX_COLUMNS];
             let start_pos = rdr.position().clone();
             while rdr.read_record(&mut raw_record)? {
                 if is_comment(&raw_record, comment_char as char) {
@@ -720,7 +768,7 @@ pub fn format_file<P: AsRef<Path>, W: io::Write>(fmt_args: &FmtArgs, file_path: 
         } else {
             // This way instead read the whole file in two-passes.
             // The first computes the column width and the second formats the lines and writes them
-            let mut cols_width = vec![0; 1000];
+            let mut cols_width = vec![0; MAX_COLUMNS];
             let start_pos = rdr.position().clone();
             while rdr.read_byte_record(&mut raw_record)? {
                 if is_comment_byte(&raw_record, comment_char) {
@@ -809,14 +857,19 @@ pub fn run(fmt_args: FmtArgs) -> anyhow::Result<()> {
     let mut in_stream: Box<dyn io::Read> = get_in_stream(in_file.as_ref())?;
     let out_file: Option<PathBuf> = get_output_dest(&fmt_args);
     let mut out_stream: Box<dyn io::Write> = get_out_stream(out_file.as_ref())?;
+    // Set true if writing to STDOUT and STDOUT prints to the terminal
+    let istty: bool = out_file.is_none() && stdout().is_terminal();
+    debug!("in_file: {:?}", &in_file);
+    debug!("out_file: {:?}", &out_file);
+    debug!("istty: {istty}");
 
     if fmt_args.in_place {
         // The arguments should have already been checked
-        assert!(fmt_args.output.is_none());
-        assert!(fmt_args.input.is_some());
+        debug_assert!(fmt_args.output.is_none());
+        debug_assert!(fmt_args.input.is_some());
 
         // There should be a file to write to that will then be renamed as the original file
-        assert!(out_file.is_some());
+        debug_assert!(out_file.is_some());
     }
 
     // Set CTRL+C signal handler. Removes temporary files if present and stop the process
@@ -831,49 +884,30 @@ pub fn run(fmt_args: FmtArgs) -> anyhow::Result<()> {
         ctrlc::set_handler(|| exit(2)).expect("Error setting Ctrl-C handler");
     }
 
-    let delimiter = get_delimiter(&fmt_args);
-    let quote_style = match fmt_args.quote_style.as_str() {
-        "necessary" => QuoteStyle::Necessary,
-        "always" => QuoteStyle::Always,
-        "never" => QuoteStyle::Never,
-        "non-numeric" => QuoteStyle::NonNumeric,
-        _ => bail!("This --quote-style option is not available"),
-    };
-
-    let formatter = CsvFormatter::new()
-        .set_delimiter(delimiter)
-        .set_flexible(fmt_args.flexible)
-        .set_quote_char(fmt_args.quote_char)
-        .set_quote_style(quote_style)
-        .set_comment_char(Some(fmt_args.comment_char));
+    let formatter = CsvFormatter::from_args(&fmt_args);
+    debug!("formatter args: {:#?}", &formatter);
 
     if fmt_args.strip {
         formatter.strip(&mut in_stream, &mut out_stream)?
-    } else if let Some(in_file) = in_file {
+    } else if let Some(in_file) = in_file.as_ref() {
         formatter.format_file(in_file, &mut out_stream)?
     } else {
         formatter.format(&mut in_stream, &mut out_stream)?
     };
 
-    // if fmt_args.strip {
-    //     strip(&fmt_args, &mut in_stream, &mut out_stream)?
-    // } else if let Some(in_file) = in_file {
-    //     format_file(&fmt_args, in_file, &mut out_stream)?
-    // } else {
-    //     format(&fmt_args, &mut in_stream, &mut out_stream)?
-    // };
-
     // In case the --in-place flag was given overwrite the original file with the temporary one
     if fmt_args.in_place {
-        let in_file = &fmt_args
-            .input
-            .expect("Program logic error: Input should have been given with the --in-place flag.");
+        let in_file = in_file.expect("Program logic error: Input should have been given with the --in-place flag.");
         let out_file = out_file.expect("Program logic error: Output file should have already been specified.");
-        fs::rename(&out_file, in_file)
+        debug!(
+            "Replacing input file with tmp output: {:?} -- renamed to -> {:?}",
+            &out_file, &in_file
+        );
+        fs::rename(&out_file, &in_file)
             .context(format!(
-                "Unable to overwrite the original file with the temporary formatted file. \nTmp file: {:?} -X-> input file: {:?}",
-                out_file,
-                in_file)
+                "Unable to overwrite the original file with the temporary formatted file. \nTmp file: {:?} --X-> input file: {:?}",
+                &out_file,
+                &in_file)
             )?
     }
 
@@ -928,6 +962,46 @@ ciao2,gatto,extra field
         let correct_out_stream: &[u8] = br#"ciao1       ,wow
 ciao1 tutti ,wow
 ciao2       ,gatto ,extra field
+"#;
+
+        let formatter = CsvFormatter::default().set_delimiter(',').set_comment_char(Some('#'));
+        let out_stream = run_format(&formatter, in_stream)?;
+        if out_stream != correct_out_stream {
+            println!("in_stream: \n{}", String::from_utf8_lossy(in_stream));
+            println!("out_stream: \n{}", String::from_utf8_lossy(&out_stream));
+            println!("correct_out_stream: \n{}", String::from_utf8_lossy(correct_out_stream));
+        }
+        assert_eq!(out_stream, correct_out_stream);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_extra_fields_panic() {
+        let in_stream: &[u8] = br#"
+ciao1,wow
+ciao1 tutti,wow
+ciao2,gatto,extra field
+"#;
+
+        let formatter = CsvFormatter::default()
+            .set_delimiter(',')
+            .set_comment_char(Some('#'))
+            .set_flexible(false);
+        let out_stream = run_format(&formatter, in_stream);
+        assert!(out_stream.is_err())
+    }
+
+    #[test]
+    fn parse_empty_fields() -> Result<()> {
+        let in_stream: &[u8] = br#"
+ciao1,      ,
+ciao1 , ,
+ciao2,,extra field
+"#;
+
+        let correct_out_stream: &[u8] = br#"ciao1 ,,
+ciao1 ,,
+ciao2 ,,extra field
 "#;
 
         let formatter = CsvFormatter::default().set_delimiter(',').set_comment_char(Some('#'));

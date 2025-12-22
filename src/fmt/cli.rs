@@ -32,11 +32,11 @@ pub struct FmtArgs {
     pub quote_char: char,
 
     /// Choose when to quote output
-    #[arg(short, long, default_value = "necessary", required = false, value_parser=["necessary", "always", "never"])]
+    #[arg(long, default_value = "necessary", required = false, value_parser=["necessary", "always", "never"])]
     pub quote_style: String,
 
     /// Exit if the rows do not have the same number of columns.
-    #[arg(long="no-flexible", default_value_t = false, required = false, action=ArgAction::SetFalse)]
+    #[arg(long="no-flexible", default_value_t = true, required = false, action=ArgAction::SetFalse)]
     pub flexible: bool,
 
     /// Do not format the whole file at one time but buffer the first 16384 lines to get the max width per column,
@@ -104,6 +104,7 @@ mod tests {
             output: None,
             input: None,
             no_skip_comments: false,
+            quote_style: "necessary".to_owned(),
         };
 
         // Input cannot be None if in_place is true
