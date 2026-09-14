@@ -1,14 +1,24 @@
 use std::path::PathBuf;
 
 use crate::fmt::DEFAULT_BUFFER_LINES;
-use clap::{command, ArgAction, Args};
+use clap::{ArgAction, Args, ValueEnum};
 use lazy_static::lazy_static;
 
 lazy_static! {
     static ref DEFAULT_BUFFER_LINES_STR: String = DEFAULT_BUFFER_LINES.to_string();
 }
 
-#[derive(Debug, Clone, Args)]
+#[derive(ValueEnum, Clone, Debug)]
+pub enum Color {
+    /// Always use colors
+    Always,
+    /// Never use colors
+    Never,
+    /// Use colors only when printing to terminal
+    Auto,
+}
+
+#[derive(Args, Debug, Clone)]
 #[command(flatten_help = true)]
 pub struct FmtArgs {
     /// Strip extra spaces around the values instead of padding them
@@ -49,6 +59,10 @@ pub struct FmtArgs {
     /// Keep in mind that a new temporary file will be created, and then renamed.
     #[arg(short, long, action=ArgAction::SetTrue)]
     pub in_place: bool,
+
+    /// Print colored outputs
+    #[arg(long, default_value_t=Color::Auto, value_enum)]
+    pub color: Color,
 
     /// Needed to properly format UTF-8 data. The default is to treat the data as just bytes
     /// because it's much faster
@@ -95,6 +109,7 @@ mod tests {
         let mut fmt_args = FmtArgs {
             strip: false,
             in_place: true,
+            color: Color::Auto,
             flexible: true,
             delimiter: Some(','),
             comment_char: '#',
