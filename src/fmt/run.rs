@@ -8,16 +8,16 @@ use csv::{self, ByteRecord, QuoteStyle, StringRecord, Terminator};
 use rand::{distributions::Alphanumeric, Rng};
 use simplelog::debug;
 use std::io::stdout;
-use std::io::BufReader;
 use std::io::IsTerminal;
+use std::io::{self};
+use std::os::fd::AsFd;
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self},
     path::{Path, PathBuf},
     process::exit,
 };
 
-const MAX_COLUMNS: usize = 10000;
+const DEFAULT_TMP_VEC_SIZE: usize = 100;
 
 const RESET_STYLE: &[u8; 4] = b"\x1b[0m";
 const COLORS: [[u8; 5]; 6] = [
@@ -28,6 +28,7 @@ const COLORS: [[u8; 5]; 6] = [
     *b"\x1b[35m", // magenta
     *b"\x1b[36m", // cyan
 ];
+
 // SAFETY: These are ANSI color codes, convertible to utf8. The unsafe allows to avoid
 // str::from_utf8() and calls to .unwrap() which cannot be done in const statements.
 const COLORS_STR: [&str; 6] = unsafe {
@@ -143,6 +144,7 @@ impl CsvFormatter {
             .double_quote(self.double_quote)
             .comment(None)
             .terminator(self.terminator)
+            .buffer_capacity(256 * 1024)
             .from_reader(in_stream)
     }
 
@@ -156,6 +158,7 @@ impl CsvFormatter {
             .quote_style(self.quote_style)
             .comment(None)
             // .terminator(self.terminator)
+            .buffer_capacity(256 * 1024)
             .from_writer(out_stream)
     }
 
@@ -209,34 +212,32 @@ impl CsvFormatter {
         mut rdr: csv::Reader<&mut R>,
         mut wrt: csv::Writer<&mut W>,
     ) -> Result<()> {
-        let mut buffer: Vec<ByteRecord> = Vec::with_capacity(DEFAULT_BUFFER_LINES);
         if let Some(buffer_lines) = self.buffer {
-            for (line_n, record) in rdr.byte_records().enumerate() {
-                if line_n > buffer_lines {
-                    break;
-                }
-                buffer.push(record?);
-            }
-
-            let cols_width =
-                pad_and_write_buffered_byte(&mut wrt, &buffer, self.comment_char.map(|c| c as u8), self.use_color)?;
+            let cols_width = pad_and_write_buffered_byte(
+                &mut wrt,
+                &mut rdr,
+                Some(buffer_lines),
+                self.comment_char.map(|c| c as u8),
+                self.use_color,
+            )?;
             wrt.flush()?;
 
             pad_and_write_unbuffered_byte(
                 &mut wrt,
                 &mut rdr,
-                self.comment_char.map(|c| c as u8),
                 cols_width,
+                self.comment_char.map(|c| c as u8),
                 self.use_color,
             )?;
             wrt.flush()?;
         } else {
-            // TODO: Add saving the buffer to a file in case it exceed the memory available
-            for record in rdr.byte_records() {
-                let record = record?;
-                buffer.push(record);
-            }
-            pad_and_write_buffered_byte(&mut wrt, &buffer, self.comment_char.map(|c| c as u8), self.use_color)?;
+            pad_and_write_buffered_byte(
+                &mut wrt,
+                &mut rdr,
+                None,
+                self.comment_char.map(|c| c as u8),
+                self.use_color,
+            )?;
             wrt.flush()?;
         }
 
@@ -331,8 +332,7 @@ fn is_comment_byte(record: &csv::ByteRecord, comment_char: u8) -> bool {
     record.get(0).unwrap_or(b"").starts_with(&[comment_char])
 }
 
-// Get the delimiter either from the FmtArgs, from the file extension or the default
-// DEFAULT_DELIMITER
+// Get the delimiter either from the FmtArgs, from the file extension or the default one.
 fn get_delimiter(fmt_args: &FmtArgs) -> char {
     if let Some(delimiter) = fmt_args.delimiter {
         return delimiter;
@@ -344,23 +344,6 @@ fn get_delimiter(fmt_args: &FmtArgs) -> char {
         Some(ext) if ext == "tab" => '\t',
         _ => DEFAULT_DELIMITER,
     }
-    // if let Some(delimiter) = fmt_args.delimiter {
-    //     delimiter
-    // } else if fmt_args
-    //     .input
-    //     .as_ref()
-    //     .is_some_and(|path| path.extension().is_some_and(|ext| ext == "csv"))
-    // {
-    //     ','
-    // } else if fmt_args
-    //     .input
-    //     .as_ref()
-    //     .is_some_and(|path| path.extension().is_some_and(|ext| ext == "tsv"))
-    // {
-    //     '\t'
-    // } else {
-    //     DEFAULT_DELIMITER
-    // }
 }
 
 pub fn pad_and_write_unbuffered<W, R>(
@@ -436,7 +419,7 @@ pub fn pad_and_write_buffered<W>(
 where
     W: io::Write,
 {
-    let mut cols_width: Vec<usize> = vec![0; MAX_COLUMNS];
+    let mut cols_width: Vec<usize> = Vec::new();
 
     for record in buffer.iter() {
         if comment_char.is_some_and(|c| is_comment(record, c)) {
@@ -456,8 +439,7 @@ where
     }
 
     let tmp_spaces = " ".repeat(*cols_width.iter().max().unwrap_or(&1));
-    let mut tmp_field = String::with_capacity(cols_width.iter().sum());
-    let mut tmp_record = StringRecord::with_capacity(cols_width.iter().sum(), cols_width.len());
+    let mut tmp_field = String::with_capacity(cols_width.iter().max().unwrap_or(&0) + DEFAULT_TMP_VEC_SIZE);
     for record in buffer.iter() {
         if comment_char.is_some_and(|c| is_comment(record, c)) {
             wrt.write_record(record)?;
@@ -466,20 +448,10 @@ where
 
         // Skip empty lines or filled with only spaces
         if record.len() <= 1 && record.get(0).unwrap_or("").trim().is_empty() {
-            tmp_record.clear();
-            wrt.write_record(&tmp_record)?;
+            wrt.write_record(None::<&[u8]>)?;
             continue;
         }
 
-        // for (col, value) in record.iter().enumerate() {
-        //     tmp_field.clear();
-        //     tmp_field.extend_from_slice(value);
-        //     tmp_field.extend_from_slice(&tmp_spaces[0..(cols_width[col] - value.len())]);
-        //     wrt.write_field(&tmp_field)?
-        // }
-        // wrt.write_record(None::<&[u8]>)?;
-
-        tmp_record.clear();
         for (col, field) in record.iter().map(|field| field.trim_end()).enumerate() {
             tmp_field.clear();
             if use_color {
@@ -494,9 +466,9 @@ where
             if use_color {
                 tmp_field.push_str(RESET_STYLE_STR);
             }
-            tmp_record.push_field(&tmp_field);
+            wrt.write_field(&tmp_field)?;
         }
-        wrt.write_record(&tmp_record)?;
+        wrt.write_record(None::<&[u8]>)?;
     }
     Ok(cols_width)
 }
@@ -504,17 +476,15 @@ where
 pub fn pad_and_write_unbuffered_byte<W, R>(
     wrt: &mut csv::Writer<W>,
     rdr: &mut csv::Reader<R>,
-    comment_char: Option<u8>,
     mut cols_width: Vec<usize>,
+    comment_char: Option<u8>,
     add_color: bool,
 ) -> Result<Vec<usize>>
 where
     W: io::Write,
     R: io::Read,
 {
-    let mut tmp_spaces = [b' '].repeat(*cols_width.iter().max().unwrap_or(&1));
-    let mut tmp_field = Vec::with_capacity(cols_width.iter().sum());
-    let mut tmp_byte_record = ByteRecord::with_capacity(cols_width.iter().sum(), cols_width.len());
+    let mut tmp_field = Vec::with_capacity(cols_width.iter().max().unwrap_or(&0) + DEFAULT_TMP_VEC_SIZE);
     let mut raw_record = ByteRecord::new();
 
     while rdr.read_byte_record(&mut raw_record)? {
@@ -525,8 +495,7 @@ where
 
         // Skip empty lines or filled with only spaces
         if raw_record.len() <= 1 && raw_record.get(0).unwrap_or(b"").trim_ascii().is_empty() {
-            tmp_byte_record.clear();
-            wrt.write_record(&tmp_byte_record)?;
+            wrt.write_record(None::<&[u8]>)?;
             continue;
         }
 
@@ -534,66 +503,87 @@ where
             cols_width.resize(raw_record.len(), 0);
         }
 
-        tmp_byte_record.clear();
         for (col, field) in raw_record.iter().map(|field| field.trim_ascii_end()).enumerate() {
-            // Trimmed and added 1 for the the space at the end
-            let field_width = field.len();
-            if cols_width[col] < field_width {
-                cols_width[col] = field_width;
-                tmp_spaces = [b' '].repeat(tmp_spaces.len().max(field_width));
+            if cols_width[col] < field.len() {
+                cols_width[col] = field.len();
             }
+
+            // if the field is not the last, and the max_width is not 0 then add a space at the end
+            let padding = if col != raw_record.len() - 1 && cols_width[col] != 0 {
+                cols_width[col] - field.len() + 1
+            } else {
+                0
+            };
+
+            // Fast path for the last column in case --color=never
+            if !add_color && padding == 0 {
+                wrt.write_field(field)?;
+                continue;
+            }
+
             tmp_field.clear();
+
             if add_color {
                 tmp_field.extend_from_slice(&COLORS[col % COLORS.len()]);
             }
-            tmp_field.extend_from_slice(field);
 
-            // if the field is not the last, and the max_width is not 0 then add a space at the end
-            if col != raw_record.len() - 1 && cols_width[col] != 0 {
-                tmp_field.extend_from_slice(&tmp_spaces[0..(cols_width[col] - field.len() + 1)]);
-            }
+            tmp_field.extend_from_slice(field);
+            tmp_field.resize(tmp_field.len() + padding, b' ');
+
             if add_color {
                 tmp_field.extend_from_slice(RESET_STYLE);
             }
-            tmp_byte_record.push_field(&tmp_field);
+
+            wrt.write_field(&tmp_field)?;
         }
-        wrt.write_byte_record(&tmp_byte_record)?;
+        wrt.write_record(None::<&[u8]>)?;
     }
 
     Ok(cols_width)
 }
 
-pub fn pad_and_write_buffered_byte<W>(
+pub fn pad_and_write_buffered_byte<W, R>(
     wrt: &mut csv::Writer<W>,
-    buffer: &[ByteRecord],
+    rdr: &mut csv::Reader<R>,
+    buffer_lines: Option<usize>,
     comment_char: Option<u8>,
     add_color: bool,
 ) -> Result<Vec<usize>>
 where
     W: io::Write,
+    R: io::Read,
 {
-    let mut cols_width: Vec<usize> = vec![0; MAX_COLUMNS];
+    let mut cols_width: Vec<usize> = Vec::new();
+    let mut buffer: Vec<ByteRecord>;
+    let iterator;
 
-    for record in buffer.iter() {
-        if comment_char.is_some_and(|c| is_comment_byte(record, c)) {
-            continue;
-        }
+    if let Some(buffer_lines) = buffer_lines {
+        buffer = Vec::with_capacity(buffer_lines);
+        iterator = rdr.byte_records().take(buffer_lines);
+    } else {
+        buffer = Vec::new();
+        iterator = rdr.byte_records().take(usize::MAX);
+    };
 
-        if cols_width.len() < record.len() {
-            cols_width.resize(record.len(), 0);
-        }
+    for record in iterator {
+        let record = record?;
+        if !comment_char.is_some_and(|c| is_comment_byte(&record, c)) {
+            if cols_width.len() < record.len() {
+                cols_width.resize(record.len(), 0);
+            }
 
-        // Each field is trimmed and added 1 for the the space at the end
-        for (col, field_width) in record.iter().map(|field| field.trim_ascii_end().len()).enumerate() {
-            if cols_width[col] < field_width {
-                cols_width[col] = field_width
+            // Each field is trimmed
+            for (col, field_width) in record.iter().map(|field| field.trim_ascii_end().len()).enumerate() {
+                if cols_width[col] < field_width {
+                    cols_width[col] = field_width
+                }
             }
         }
+
+        buffer.push(record);
     }
 
-    let tmp_spaces = [b' '].repeat(*cols_width.iter().max().unwrap_or(&1));
-    let mut tmp_field = Vec::with_capacity(cols_width.iter().sum());
-    let mut tmp_byte_record = ByteRecord::with_capacity(cols_width.iter().sum(), cols_width.len());
+    let mut tmp_field = Vec::with_capacity(cols_width.iter().max().unwrap_or(&0) + DEFAULT_TMP_VEC_SIZE);
     for record in buffer.iter() {
         if comment_char.is_some_and(|c| is_comment_byte(record, c)) {
             wrt.write_byte_record(record)?;
@@ -602,39 +592,40 @@ where
 
         // Skip empty lines or filled with only spaces
         if record.len() <= 1 && record.get(0).unwrap_or(b"").trim_ascii().is_empty() {
-            tmp_byte_record.clear();
-            wrt.write_record(&tmp_byte_record)?;
+            wrt.write_record(None::<&[u8]>)?;
             continue;
         }
 
-        // for (col, value) in record.iter().enumerate() {
-        //     tmp_field.clear();
-        //     tmp_field.extend_from_slice(value);
-        //     tmp_field.extend_from_slice(&tmp_spaces[0..(cols_width[col] - value.len())]);
-        //     wrt.write_field(&tmp_field)?
-        // }
-        // wrt.write_record(None::<&[u8]>)?;
-
-        tmp_byte_record.clear();
         for (col, field) in record.iter().map(|field| field.trim_ascii_end()).enumerate() {
+            // if the field is not the last, and the max_width is not 0 then add a space at the end
+            let padding = if col != record.len() - 1 && cols_width[col] != 0 {
+                cols_width[col] - field.len() + 1
+            } else {
+                0
+            };
+
+            // Fast path for the last column in case --color=never
+            if !add_color && padding == 0 {
+                wrt.write_field(field)?;
+                continue;
+            }
+
             tmp_field.clear();
+
             if add_color {
                 tmp_field.extend_from_slice(&COLORS[col % COLORS.len()]);
             }
-            tmp_field.extend_from_slice(field);
 
-            // if the field is not the last, and the max_width is not 0 then add a space at the end
-            if col != record.len() - 1 && cols_width[col] != 0 {
-                tmp_field.extend_from_slice(&tmp_spaces[0..(cols_width[col] - field.len() + 1)]);
-            }
+            tmp_field.extend_from_slice(field);
+            tmp_field.resize(tmp_field.len() + padding, b' ');
 
             if add_color {
                 tmp_field.extend_from_slice(RESET_STYLE);
             }
 
-            tmp_byte_record.push_field(&tmp_field);
+            wrt.write_field(&tmp_field)?;
         }
-        wrt.write_byte_record(&tmp_byte_record)?;
+        wrt.write_record(None::<&[u8]>)?;
     }
     Ok(cols_width)
 }
@@ -684,7 +675,9 @@ fn get_out_stream(out_file: Option<&PathBuf>) -> Result<Box<dyn io::Write>> {
             .context(format!("Error in opening output file {:?}", output_file))?;
         Box::new(file_handle)
     } else {
-        Box::new(io::stdout().lock())
+        let owned = std::io::stdout().as_fd().try_clone_to_owned().unwrap();
+        let file_handle = std::fs::File::from(owned);
+        Box::new(file_handle)
     };
     Ok(out_stream)
 }

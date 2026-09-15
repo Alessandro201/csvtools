@@ -1,13 +1,31 @@
 use anyhow::Result;
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{
+    builder::{
+        styling::{AnsiColor, Effects},
+        Styles,
+    },
+    ArgAction, Parser, Subcommand,
+};
 use simplelog::*;
 mod fmt;
+
+fn styles() -> Styles {
+    Styles::styled()
+        .header(AnsiColor::Yellow.on_default().effects(Effects::BOLD)) // "Options:" etc.
+        .usage(AnsiColor::Green.on_default().effects(Effects::BOLD))
+        .literal(AnsiColor::Cyan.on_default()) // flags & subcommands
+        .placeholder(AnsiColor::Blue.on_default()) // <VALUE> placeholders
+        .valid(AnsiColor::Green.on_default()) // valid values in errors
+        .invalid(AnsiColor::Red.on_default()) // invalid values in errors
+        .error(AnsiColor::Red.on_default().effects(Effects::BOLD))
+}
 
 /// CSV utility tools
 #[derive(Debug, Parser)]
 #[command(name = "csv")]
 #[command(about = "A collection of CSV tools", long_about = None, version)]
 #[command(propagate_version = true)]
+#[command(color= clap::ColorChoice::Auto, styles=styles())]
 struct Cli {
     /// Turn debugging information on
     #[arg(long, action=ArgAction::SetTrue)]
