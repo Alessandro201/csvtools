@@ -74,9 +74,6 @@ impl Default for CsvFormatter {
 }
 
 impl CsvFormatter {
-    pub fn new() -> Self {
-        CsvFormatter::default()
-    }
     pub fn set_delimiter(self, delimiter: char) -> Self {
         CsvFormatter { delimiter, ..self }
     }
@@ -115,13 +112,6 @@ impl CsvFormatter {
         }
     }
     pub fn from_args(fmt_args: &FmtArgs) -> Self {
-        let quote_style = match fmt_args.quote_style.as_str() {
-            "necessary" => QuoteStyle::Necessary,
-            "always" => QuoteStyle::Always,
-            "never" => QuoteStyle::Never,
-            "non-numeric" => QuoteStyle::NonNumeric,
-            _ => panic!("This --quote-style option is not available"),
-        };
         Self::default()
             .set_delimiter(get_delimiter(fmt_args))
             .set_comment_char({
@@ -133,7 +123,9 @@ impl CsvFormatter {
             })
             .set_flexible(fmt_args.flexible)
             .set_quote_char(fmt_args.quote_char)
-            .set_quote_style(quote_style)
+            .set_quote_style(fmt_args.quote_style)
+            .set_double_quote(fmt_args.double_quote)
+            .set_terminator(fmt_args.terminator)
             .set_utf8(fmt_args.utf8)
             .set_buffer(fmt_args.buffer_fmt)
             .set_quote_char(fmt_args.quote_char)
@@ -150,7 +142,7 @@ impl CsvFormatter {
             .quote(self.quote_char as u8)
             .double_quote(self.double_quote)
             .comment(None)
-            // .terminator(self.terminator)
+            .terminator(self.terminator)
             .from_reader(in_stream)
     }
 
